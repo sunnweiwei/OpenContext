@@ -34,7 +34,7 @@ as they are, and every strategy works with every agent.
 
 <h3>×</h3>
 
-**9 strategies**
+**10 strategies**
 
 <table>
 <tr>
@@ -49,6 +49,7 @@ as they are, and every strategy works with every agent.
 <td align="center" width="120"><img src="docs/icons/acm.svg" width="44"><br><sub><b><code>acm</code></b><br>ACM<br><a href="https://arxiv.org/abs/2607.23809">paper</a></sub></td>
 <td align="center" width="120"><img src="docs/icons/mem1.svg" width="44"><br><sub><b><code>mem1</code></b><br>MEM1<br><a href="https://arxiv.org/abs/2506.15841">paper</a></sub></td>
 <td align="center" width="120"><img src="docs/icons/rlm.svg" width="44"><br><sub><b><code>rlm</code></b><br>RLM<br><a href="https://arxiv.org/abs/2512.24601">paper</a></sub></td>
+<td align="center" width="120"><img src="docs/icons/ace.svg" width="44"><br><sub><b><code>ace</code></b><br>ACE<br><a href="https://arxiv.org/abs/2510.04618">paper</a></sub></td>
 </tr>
 </table>
 
