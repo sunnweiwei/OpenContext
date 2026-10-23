@@ -1,0 +1,5 @@
+{
+  "name": "opencontext",
+  "owner": {"name": "OpenContext"},
+  "plugins": [{"name": "opencontext", "source": "./opencontext", "description": "OpenContext's context strategy as Claude Code's compaction."}]
+}

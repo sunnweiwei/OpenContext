@@ -1,0 +1,5 @@
+{
+  "name": "opencontext",
+  "version": "0.1.0",
+  "description": "OpenContext's context strategy as Claude Code's compaction: Claude Code decides when, OpenContext what into."
+}

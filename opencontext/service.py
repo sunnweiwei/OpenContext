@@ -1,0 +1,256 @@
+"""OpenContext as a process of the user's: started by `opencontext setup` and `opencontext start`; once no harness goes
+through it, no longer started at login (it runs on until the machine restarts).
+
+A harness pointed at OpenContext reaches its model only through OpenContext, so OpenContext must be running. By
+default it runs as a process of its own (a daemon: its pid and its log in OpenContext's directory),
+outside the session that started it, and nothing is registered with the system. A harness that
+runs a command as a session starts (Claude Code's SessionStart hook) runs `opencontext start`, which
+returns at once while OpenContext answers and starts it otherwise, so a machine's restart costs
+nothing. `opencontext setup --autostart` registers OpenContext with the system's service manager instead
+(a systemd user unit on Linux, a launchd agent on macOS), which starts it at login and again if it
+exits. What runs it is recorded in OpenContext's directory (`service.json`).
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+from . import settings
+
+NAME = "opencontext"
+LABEL = "com.opencontext.serve"  # launchd
+PACKAGE = Path(__file__).resolve().parent.parent  # where `python -m opencontext.cli` finds OpenContext
+
+
+def command() -> list[str]:
+    return [sys.executable, "-m", "opencontext.cli", "serve"]
+
+
+def log_file() -> Path:
+    return settings.home() / "opencontext.log"
+
+
+def address() -> str:
+    return f"http://{settings.value('host', '127.0.0.1')}:{settings.value('port', '8787')}"
+
+
+def status(timeout: float = 2.0) -> dict[str, Any] | None:
+    """What the running OpenContext reports (`/opencontext/v1/status`), or None if none answers."""
+
+    try:
+        with urllib.request.urlopen(f"{address()}/opencontext/v1/status", timeout=timeout) as response:
+            return json.loads(response.read())
+    except (OSError, ValueError):
+        return None
+
+
+def taken() -> bool:
+    """Whether something listens where OpenContext should (OpenContext or not)."""
+
+    with socket.socket() as probe:
+        probe.settimeout(1.0)
+        return probe.connect_ex((settings.value("host", "127.0.0.1"), int(settings.value("port", "8787")))) == 0
+
+
+def free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind((settings.value("host", "127.0.0.1"), 0))
+        return probe.getsockname()[1]
+
+
+def wait(strategy: str | None = None, seconds: float = 30.0) -> dict[str, Any] | None:
+    """The running OpenContext's status once it answers (and runs `strategy`, if given)."""
+
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if (now := status()) is not None and (strategy is None or now.get("strategy") == strategy):
+            return now
+        time.sleep(0.3)
+    return None
+
+
+def manager() -> str:
+    """What can keep OpenContext running here: "systemd", "launchd" or "process"."""
+
+    if sys.platform == "darwin" and shutil.which("launchctl"):
+        return "launchd"
+    if shutil.which("systemctl") and subprocess.run(["systemctl", "--user", "show-environment"],
+                                                     capture_output=True).returncode == 0:
+        return "systemd"
+    return "process"
+
+
+def record() -> dict[str, Any]:
+    try:
+        return json.loads((settings.home() / "service.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _remember(entry: dict[str, Any] | None) -> None:
+    path = settings.home() / "service.json"
+    if entry is None:
+        path.unlink(missing_ok=True)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(entry, indent=2) + "\n")
+
+
+def unit() -> str:
+    """The systemd user unit."""
+
+    return (f"[Unit]\nDescription=OpenContext, context management for coding agents\n\n[Service]\n"
+            f"ExecStart={' '.join(command())}\nWorkingDirectory={PACKAGE}\nRestart=always\nRestartSec=2\n"
+            f"StandardOutput=append:{log_file()}\nStandardError=append:{log_file()}\n\n"
+            f"[Install]\nWantedBy=default.target\n")
+
+
+def agent() -> str:
+    """The launchd agent."""
+
+    arguments = "".join(f"<string>{part}</string>" for part in command())
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>'
+            f"<key>Label</key><string>{LABEL}</string><key>ProgramArguments</key><array>{arguments}</array>"
+            f"<key>WorkingDirectory</key><string>{PACKAGE}</string><key>RunAtLoad</key><true/>"
+            f"<key>KeepAlive</key><true/><key>StandardOutPath</key><string>{log_file()}</string>"
+            f"<key>StandardErrorPath</key><string>{log_file()}</string></dict></plist>\n")
+
+
+def start(autostart: bool = False) -> str:
+    """Run OpenContext: a daemon of its own, or with `autostart` under the service manager (started now
+    and at every login); which one."""
+
+    kind = manager() if autostart else "process"
+    log_file().parent.mkdir(parents=True, exist_ok=True)
+    if kind == "systemd":
+        path = Path("~/.config/systemd/user/opencontext.service").expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(unit())
+        _run(["systemctl", "--user", "daemon-reload"])
+        _run(["systemctl", "--user", "enable", "--now", f"{NAME}.service"])
+        _run(["systemctl", "--user", "restart", f"{NAME}.service"])  # (an older one: the current settings)
+        _remember({"manager": kind, "path": str(path)})
+    elif kind == "launchd":
+        path = Path(f"~/Library/LaunchAgents/{LABEL}.plist").expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(agent())
+        domain = f"gui/{os.getuid()}"
+        subprocess.run(["launchctl", "bootout", f"{domain}/{LABEL}"], capture_output=True)
+        subprocess.run(["launchctl", "enable", f"{domain}/{LABEL}"], capture_output=True)  # (if released before)
+        _run(["launchctl", "bootstrap", domain, str(path)])
+        _remember({"manager": kind, "path": str(path)})
+    else:
+        with _locked():  # (two sessions starting at once start one OpenContext)
+            _daemon()
+    return kind
+
+
+def _daemon() -> None:
+    """OpenContext as a process of its own, outside the caller's session and its signals (lock held)."""
+
+    stop_process()
+    _rotate()
+    with log_file().open("ab") as log:
+        process = subprocess.Popen(command(), cwd=PACKAGE, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                   start_new_session=True)
+    _remember({"manager": "process", "pid": process.pid})
+
+
+def ensure(seconds: float = 20.0) -> dict[str, Any] | None:
+    """OpenContext running: at once if it answers, else started as it was set up (its status, or None)."""
+
+    if (now := status(timeout=1.0)) is not None:
+        return now
+    entry = record()
+    if entry.get("manager") in ("systemd", "launchd"):
+        restart()
+    else:
+        with _locked():
+            if status(timeout=1.0) is None:  # (not started meanwhile by another session)
+                _daemon()
+    return wait(seconds=seconds)
+
+
+def start_command() -> str:
+    """A shell command that makes sure OpenContext runs, cheap while it does, and says nothing (a
+    harness's hook: some add what a session-start hook prints to the model's context)."""
+
+    probe = f"import urllib.request as u; u.urlopen('{address()}/opencontext/v1/status', timeout=1)"
+    start = f"cd {shlex.quote(str(PACKAGE))} && {' '.join(map(shlex.quote, command()[:-1]))} start"
+    return f'{shlex.quote(sys.executable)} -c "{probe}" >/dev/null 2>&1 || ({start}) >/dev/null 2>&1; true'
+
+
+def restart() -> None:
+    """Start OpenContext again with its current settings (where it listens, its upstreams, its store)."""
+
+    kind = record().get("manager")
+    if kind == "systemd":
+        _run(["systemctl", "--user", "restart", f"{NAME}.service"])
+    elif kind == "launchd":
+        _run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{LABEL}"])
+    else:
+        start()
+
+
+def release() -> str | None:
+    """No harness goes through OpenContext any more: the service manager stops starting it at login. The
+    one running goes on, for the conversations still open on its address; what had kept it running."""
+
+    kind = record().get("manager")
+    if kind == "systemd":
+        subprocess.run(["systemctl", "--user", "disable", f"{NAME}.service"], capture_output=True)
+    elif kind == "launchd":
+        subprocess.run(["launchctl", "disable", f"gui/{os.getuid()}/{LABEL}"], capture_output=True)
+    return kind
+
+
+def stop_process() -> None:
+    pid = record().get("pid")
+    if not pid:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    for _ in range(50):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+        time.sleep(0.1)
+
+
+def _rotate(limit: int = 5 * 1024 * 1024) -> None:
+    """Keep the log small: past `limit`, the next start begins a new one (the last one kept)."""
+
+    if log_file().exists() and log_file().stat().st_size > limit:
+        log_file().replace(log_file().with_suffix(".log.1"))
+
+
+@contextmanager
+def _locked() -> Iterator[None]:
+    settings.home().mkdir(parents=True, exist_ok=True)
+    with (settings.home() / "start.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def _run(arguments: list[str]) -> None:
+    result = subprocess.run(arguments, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"{' '.join(arguments)}: {(result.stderr or result.stdout).strip()[:300]}")

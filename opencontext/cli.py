@@ -1,0 +1,327 @@
+"""OpenContext command line (`opencontext help` for the guide).
+
+  opencontext setup <harness> [--strategy S] [--set name=value ...] [--autostart]
+                                    save the settings, start OpenContext, point the harness at it
+  opencontext strategy [S] [--set ...]    show or change the strategy; the running OpenContext follows at once
+  opencontext settings | set name=value ... | unset name ...
+  opencontext status                      whether OpenContext runs, its strategy, the harnesses set up
+  opencontext uninstall <harness> | --all restore the harness's config (the last one: OpenContext is no longer
+                                    started at login; it runs on for conversations still open)
+  opencontext start                       make sure OpenContext runs (harness hooks run it as a session starts)
+  opencontext serve                       run OpenContext in the foreground (what the service runs)
+  opencontext install <harness> [--via]   only point a harness at OpenContext (through the proxy, or a hook)
+  opencontext run <harness> [args...]     run a harness through a private proxy
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import uvicorn
+
+from . import install, integrations, leaving, service, settings
+from .harnesses import HARNESSES, Harness
+from .strategies import STRATEGIES
+from .transport import ProxyConfig, create_app
+
+ALIASES = {"claude": "claude_code", "dsh": "deepseek_harness", "mini": "mini_swe"}
+GUIDE = Path(__file__).with_name("HELP.md")
+
+
+# Settings read only as OpenContext starts: `opencontext set` restarts the service for them.
+AT_START = {"host", "port", "harness", "trace", "event_log", "log_level", "openai_base_url", "chatgpt_base_url",
+            "anthropic_base_url", "gemini_base_url", "openai_api_key", "anthropic_api_key", "cache_path",
+            "cache_secret", "cache_ttl_seconds", "cache_max_entries", "cache_max_bytes", "cache_max_nodes"}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="opencontext", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(dest="command")
+    harnesses = sorted({*HARNESSES, *ALIASES} - {"generic"})
+    setup = commands.add_parser("setup", help="save the settings, start OpenContext, point a harness at it")
+    setup.add_argument("harness", choices=harnesses)
+    strategy = commands.add_parser("strategy", help="show or change the strategy")
+    strategy.add_argument("name", nargs="?", choices=sorted(STRATEGIES))
+    for command in (setup, strategy):
+        command.add_argument("--set", action="append", default=[], metavar="NAME=VALUE", help="a setting (repeatable)")
+    setup.add_argument("--strategy", choices=sorted(STRATEGIES))
+    setup.add_argument("--via", choices=["auto", "proxy", "hook"], default="auto",
+                       help="integration path (default: the harness's preferred one)")
+    setup.add_argument("--autostart", action="store_true",
+                       help="register OpenContext with the system's service manager (start at login, restart if it exits)")
+    commands.add_parser("settings", help="every setting written")
+    assign = commands.add_parser("set", help="change settings")
+    assign.add_argument("assignments", nargs="+", metavar="NAME=VALUE")
+    unset = commands.add_parser("unset", help="return settings to their defaults")
+    unset.add_argument("names", nargs="+", metavar="NAME")
+    commands.add_parser("status", help="whether OpenContext runs, its strategy, the harnesses set up")
+    commands.add_parser("start", help="make sure OpenContext runs")
+    commands.add_parser("help", help="the guide")
+    serve = commands.add_parser("serve", help="run OpenContext in the foreground")
+    serve.add_argument("--host")
+    serve.add_argument("--port", type=int)
+    install_ = commands.add_parser("install", help="only point a harness at OpenContext")
+    uninstall_ = commands.add_parser("uninstall", help="restore a harness")
+    install_.add_argument("harness", choices=harnesses)
+    uninstall_.add_argument("harness", choices=harnesses, nargs="?")
+    uninstall_.add_argument("--all", action="store_true", help="every harness set up")
+    uninstall_.add_argument("--now", action="store_true",
+                            help="restore it now, even if conversations that grew through OpenContext would then fail")
+    install_.add_argument("--url", help="OpenContext's address (default: the host and port settings)")
+    install_.add_argument("--via", choices=["auto", "proxy", "hook"], default="auto",
+                          help="integration path (default: the harness's preferred one)")
+    run = commands.add_parser("run", help="run a harness through a private proxy")
+    run.add_argument("harness", choices=harnesses)
+    run.add_argument("args", nargs=argparse.REMAINDER, help="arguments for the harness")
+    options = parser.parse_args(argv)
+    logging.basicConfig(level=settings.value("log_level", "INFO"), format="%(asctime)s %(name)s %(message)s")
+    harness = HARNESSES[ALIASES.get(options.harness, options.harness)] if getattr(options, "harness", None) else None
+
+    try:
+        if options.command in (None, "help"):
+            print(GUIDE.read_text(encoding="utf-8"))
+            return 0
+        if options.command == "setup":
+            return _setup(harness, options.strategy, options.set, options.via, options.autostart)
+        if options.command == "strategy":
+            return _strategy(options.name, options.set)
+        if options.command == "settings":
+            print(json.dumps(settings.load(), indent=2, sort_keys=True))
+            return 0
+        if options.command in ("set", "unset"):
+            changes = dict(map(settings.parse, options.assignments)) if options.command == "set" else {}
+            return _change(changes, tuple(getattr(options, "names", ())))
+        if options.command == "status":
+            return _status()
+        if options.command == "start":
+            _settle()
+            now = service.ensure()
+            print(f"OpenContext runs {now['strategy']} at {service.address()}" if now else
+                  f"OpenContext did not start: see {service.log_file()}", file=sys.stdout if now else sys.stderr)
+            return 0 if now else 1
+    except (ValueError, RuntimeError) as error:
+        print(f"opencontext {options.command}: {error}", file=sys.stderr)
+        return 1
+    config = ProxyConfig.from_settings()
+    if options.command == "install":
+        return _install(harness, options.via, options.url or service.address())
+    if options.command == "uninstall":
+        if options.all == bool(harness):
+            print("opencontext uninstall: name a harness, or --all", file=sys.stderr)
+            return 1
+        names = install.installed() if options.all else [harness.name]
+        return max([_uninstall(HARNESSES[name], options.now) for name in names], default=0)
+    if options.command == "run":
+        return _run(config, ALIASES.get(options.harness, options.harness), options.args)
+    host = getattr(options, "host", None) or config.host
+    port = getattr(options, "port", None) or config.port
+    uvicorn.run(create_app(config=config), host=host, port=port, ws="none")
+    return 0
+
+
+def _setup(harness: Harness, strategy: str | None, assignments: list[str], via: str, autostart: bool) -> int:
+    """The settings saved, OpenContext running with them, then the harness pointed at it (and, where it
+    runs a command as a session starts, made to start OpenContext)."""
+
+    changes = dict(map(settings.parse, assignments)) | ({"strategy": strategy} if strategy else {})
+    if changes.get("strategy", "compaction") not in STRATEGIES:
+        raise ValueError(f"unknown strategy {changes['strategy']!r}: one of {', '.join(sorted(STRATEGIES))}")
+    restart = bool(AT_START & set(changes))
+    settings.save(changes)
+    wanted = settings.value("strategy", "compaction")
+    moved = service.status() is None and service.taken()  # (something else there: not OpenContext)
+    if moved:
+        if "port" in changes:
+            raise ValueError(f"something other than OpenContext listens at {service.address()}: choose another port")
+        busy, port = service.address(), service.free_port()
+        settings.save({"port": port})
+        print(f"something other than OpenContext listens at {busy}: OpenContext listens on port {port}")
+    managed = service.record().get("manager") in ("systemd", "launchd")
+    if autostart and not managed:
+        kind = service.start(autostart=True)
+    elif service.status() is None:
+        kind = service.start() if not managed else (service.restart() or service.record()["manager"])
+    elif restart and service.record():
+        kind = service.restart() or service.record()["manager"]
+    else:
+        kind = None  # (running, and following the settings)
+    if kind:
+        print(f"started OpenContext ({'as a ' + kind + ' service' if kind != 'process' else 'as a process of its own'})")
+        if autostart and kind == "process":
+            print("  note: no service manager here: OpenContext runs as a process of its own")
+    if service.wait(wanted) is None:
+        print(f"opencontext setup: OpenContext did not answer at {service.address()} running {wanted}; the harness is left as it was."
+              f"\n{_tail(service.log_file())}", file=sys.stderr)
+        return 1
+    print(f"OpenContext runs {wanted} at {service.address()}")
+    starter = harness.starter(service.start_command())
+    leaving.stay(harness.name)  # (set up again while leaving: it stays)
+    if moved and harness.name in install.installed():
+        install.uninstall(harness.name)  # (pointed at the old port)
+    if harness.name not in install.installed() and _install(harness, via, service.address(), starter):
+        return 1
+    if not starter and service.record().get("manager") == "process":
+        print(f"  note: {harness.name} cannot start OpenContext itself: after this machine restarts, run `opencontext start` "
+              f"(or set OpenContext up with --autostart)")
+    print(f"{harness.name} goes through OpenContext: conversations started from now on use {wanted}; one already "
+          f"open goes on as it was until a new one is started (`opencontext help`, \"Which conversations change\")")
+    return 0
+
+
+def _strategy(name: str | None, assignments: list[str]) -> int:
+    if name is None and not assignments:
+        now = service.status()
+        print(f"strategy: {settings.value('strategy', 'compaction')}"
+              + (f" (OpenContext runs {now['strategy']})" if now else " (OpenContext is not running)"))
+        print("strategies: " + ", ".join(sorted(STRATEGIES)))
+        return 0
+    return _change(dict(map(settings.parse, assignments)) | ({"strategy": name} if name else {}), ())
+
+
+def _change(changes: dict, removed: tuple[str, ...]) -> int:
+    """Settings changed, and the running OpenContext following them."""
+
+    if (name := changes.get("strategy")) is not None and name not in STRATEGIES:
+        raise ValueError(f"unknown strategy {name!r}: one of {', '.join(sorted(STRATEGIES))}")
+    settings.save(changes, removed)
+    wanted = settings.value("strategy", "compaction")
+    if service.status() is None:
+        print(f"saved; OpenContext is not running (`opencontext setup <harness>` starts it)")
+        return 0
+    if AT_START & {*changes, *removed} and service.record():
+        service.restart()
+    if service.wait(wanted, seconds=15) is None:
+        print(f"saved, but the running OpenContext does not run {wanted}: see `opencontext status` and {service.log_file()}",
+              file=sys.stderr)
+        return 1
+    print(f"OpenContext runs {wanted}, for every conversation from its next request")
+    return 0
+
+
+def _status() -> int:
+    now, entry = service.status(), service.record()
+    print(f"OpenContext: {'running at ' + service.address() + ', strategy ' + now['strategy'] if now else 'not running'}")
+    kept = {"process": f"a process of its own (pid {entry.get('pid')})", "systemd": "a systemd user service",
+            "launchd": "a launchd agent"}
+    print(f"kept running by: {kept.get(entry.get('manager'), 'nothing (started by hand?)')}")
+    _settle()
+    departing = leaving.leaving()
+    print(f"harnesses set up: {', '.join(n for n in install.installed() if n not in departing) or 'none'}")
+    for name, seen in ((now or {}).get("harnesses") or {}).items():  # (as their requests said it)
+        newer = HARNESSES[name].newer(seen["release"])
+        print(f"  {name} {seen['release']}: profile checked against {seen['checked'] or 'no release'}"
+              + (" (newer: served as the newest of those)" if newer else ""))
+    for name in departing:
+        waiting = leaving.needing(name)
+        print(f"leaving OpenContext: {name}, restored by itself once {'this conversation does' if len(waiting) == 1 else 'these do'}"
+              f" not need OpenContext any more (its own `/compact` in it, or a week after its last use):")
+        for entry in waiting:
+            print(f"  · {_described(entry)}")
+    for name, when in leaving.restored().items():
+        if name not in departing and name not in install.installed():
+            print(f"left OpenContext: {name}, restored by itself {_ago(when)} (no conversation needed OpenContext any more); "
+                  "it talks to its provider directly")
+    print(f"settings: {settings.path()}")
+    return 0 if now else 1
+
+
+def _tail(path: Path, lines: int = 20) -> str:
+    try:
+        return "\n".join(path.read_text(errors="replace").splitlines()[-lines:])
+    except OSError:
+        return ""
+
+
+def _install(harness: Harness, via: str, url: str, extra: list | None = None) -> int:
+    try:
+        path = integrations.choose(harness, via)
+        setup = path.installation(url)
+        install.install(harness.name, url, [*setup.settings, *(extra or [])])
+    except ValueError as error:
+        print(f"opencontext install: {error}", file=sys.stderr)
+        return 1
+    print(f"installed {harness.name} ({path.name}): " + ", ".join(sorted({str(s.path) for s in setup.settings})))
+    for note in setup.notes:
+        print(f"  note: {note}")
+    return 0
+
+
+def _uninstall(harness: Harness, now: bool = False) -> int:
+    """The harness's configuration restored, unless conversations that grew past the model's window
+    through OpenContext would fail direct: it then leaves in two steps (opencontext/leaving.py)."""
+
+    name = harness.name
+    if name not in install.installed():
+        print(f"opencontext uninstall: {name} is not installed", file=sys.stderr)
+        return 1
+    service.status()  # (a running OpenContext writes down the conversations it served)
+    waiting = leaving.needing(name)
+    if waiting and not now:
+        leaving.leave(name)
+        one = len(waiting) == 1
+        print(f"{name} is leaving OpenContext. Its conversations now go as {name} sends them, as if direct, except "
+              f"{'this one' if one else 'these'}: grown past the model's window through OpenContext, "
+              f"{'it' if one else 'they'} would fail direct, so OpenContext keeps managing {'it' if one else 'them'}:")
+        for entry in waiting:
+            print(f"  · {_described(entry)}")
+        print(f"To keep {'it' if one else 'one'}, run {name}'s own `/compact` in it: then it fits, and goes direct too.")
+        print(f"Once no conversation needs OpenContext (or a week after the last use of each), {name}'s configuration is "
+              f"restored by itself. `opencontext status` shows what is left; `opencontext uninstall {name} --now` restores it now.")
+        return 0
+    leaving.stay(name)
+    paths = install.uninstall(name)
+    print(f"uninstalled {name}: " + ", ".join(sorted({str(path) for path in paths})))
+    for entry in waiting:  # (--now)
+        print(f"  note: this one grew past the model's window through OpenContext and fails direct: {_described(entry)}")
+    if not install.installed() and service.release() in ("systemd", "launchd"):
+        print("  no harness goes through OpenContext now: it is no longer started at login, and the one running goes on "
+              "for the conversations still open")
+    return 0
+
+
+def _ago(when: float) -> str:
+    ago = max(0, time.time() - when)
+    return ("just now" if ago < 60 else f"{ago / 60:.0f} minutes ago" if ago < 3600
+            else f"{ago / 3600:.0f} hours ago" if ago < 86400 else f"{ago / 86400:.0f} days ago")
+
+
+def _described(entry: dict) -> str:
+    return (f"\"{entry.get('title') or '(no text)'}\" — ~{entry['whole'] / 1000:.0f}k tokens for a "
+            f"{entry['window'] / 1000:.0f}k window, last used {_ago(entry['last'])}")
+
+
+def _settle() -> None:
+    """Restore the leaving harnesses none of whose conversations needs OpenContext any more."""
+
+    for name in leaving.settle():
+        print(f"{name}: no conversation needs OpenContext any more; its configuration is restored")
+
+
+def _run(config: ProxyConfig, harness: str, args: list[str]) -> int:
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    server = uvicorn.Server(uvicorn.Config(create_app(config=config), log_level="warning"))
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [listener]}, daemon=True)
+    thread.start()
+    while not server.started and thread.is_alive():
+        time.sleep(0.01)
+    url = f"http://127.0.0.1:{listener.getsockname()[1]}"
+    command, env = HARNESSES[harness].launch(url, [a for a in args if a != "--"])
+    try:
+        return subprocess.run(command, env={**os.environ, **env}, check=False).returncode
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

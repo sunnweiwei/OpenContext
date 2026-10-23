@@ -1,0 +1,4 @@
+name: opencontext-start
+version: "1"
+description: OpenContext running before every model request (opencontext setup hermes; opencontext uninstall hermes removes it).
+provides_hooks: [pre_api_request]
