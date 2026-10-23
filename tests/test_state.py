@@ -147,8 +147,8 @@ class StateTests(unittest.TestCase):
         state = DeepSeekHarness().state(CODEC, items)
         self.assertEqual([i.ref for i in state.items], [0, 2, 8])
 
-    def test_the_releases_each_profile_was_checked_against_are_the_readme_s(self) -> None:
-        readme = (Path(__file__).parents[1] / "README.md").read_text()
+    def test_the_releases_each_profile_was_checked_against_are_the_design_doc_s(self) -> None:
+        readme = (Path(__file__).parents[1] / "docs" / "design.md").read_text()
         for name, harness in HARNESSES.items():
             if name != "generic" and harness.name == name and name != "codebuddy":
                 self.assertRegex(readme, rf"\| `{name}` \| {re.escape(harness.verified)} \|", name)
