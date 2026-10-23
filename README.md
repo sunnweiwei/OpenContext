@@ -58,6 +58,14 @@ as they are, and every strategy works with every agent.
 Releases of each agent checked: [docs/design.md](docs/design.md#support). A newer release works
 as the newest one checked; `opencontext status` notes it.
 
+## How it works
+
+<p align="center"><img src="docs/how-it-works.svg" width="100%"></p>
+
+- **Proxy or hook**: your agent connects either way; its login and provider stay the same.
+- **Stateless**: the agent sends its full history; OpenContext resumes from the longest cached prefix.
+- **Uninstall**: the agent goes direct again.
+
 ## Install
 
 ### Ask your agent
