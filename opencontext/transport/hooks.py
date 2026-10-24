@@ -1,9 +1,11 @@
-"""OpenContext's endpoint for harness hooks: a harness compacting its own history asks OpenContext's
-strategy what the history should become (`opencontext.integrations`)."""
+"""OpenContext's endpoints for harness hooks: a harness compacting its own history asks OpenContext's
+strategy what the history should become, what instructions its system prompt gets, and
+what a tool's result should say as it comes in (`opencontext.integrations`)."""
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
@@ -11,19 +13,42 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from ..core.engine import Engine
-from ..integrations import HOOKS
+from ..integrations import HOOKS, uncarried
 
 log = logging.getLogger("opencontext")
 
 
-def hook_routes(engine: Engine) -> list[Route]:
-    async def compact(request: Request) -> Response:
+def hook_routes(engine: Engine, follow: Callable[[], None], noted: Callable[[str, str], None]) -> list[Route]:
+    """`follow` applies changed settings; `noted` records the harness's release its hook reports."""
+
+    async def answer(request: Request, kind: str) -> Response:
         try:
+            follow()
             payload = await request.json()
-            hook = HOOKS[payload.get("harness")]
+            name = payload.get("harness")
+            hook = HOOKS[name]
+            if payload.get("version"):
+                noted(name, payload["version"])
+            if why := uncarried(hook, engine.strategy.name):  # (`opencontext strategy` moves the harness to the proxy)
+                return JSONResponse({"error": {"message": f"opencontext: {why}; it runs through the proxy"}}, 409)
+            if kind == "instructions":
+                return JSONResponse({"instructions": await run_in_threadpool(hook.instructions, engine)})
+            if kind == "result":
+                return JSONResponse(await run_in_threadpool(hook.result, engine, payload))
             return JSONResponse(await run_in_threadpool(hook.compact, engine, payload))
         except Exception as error:  # the harness then compacts as it would without OpenContext
-            log.warning("hook compaction failed", exc_info=True)
+            log.warning("hook %s failed", kind, exc_info=True)
             return JSONResponse({"error": {"message": f"opencontext: {error!r:.300}"}}, 500)
 
-    return [Route("/opencontext/v1/compact", compact, methods=["POST"])]
+    async def compact(request: Request) -> Response:
+        return await answer(request, "compaction")
+
+    async def instructions(request: Request) -> Response:
+        return await answer(request, "instructions")
+
+    async def result(request: Request) -> Response:
+        return await answer(request, "result")
+
+    return [Route("/opencontext/v1/compact", compact, methods=["POST"]),
+            Route("/opencontext/v1/instructions", instructions, methods=["POST"]),
+            Route("/opencontext/v1/result", result, methods=["POST"])]

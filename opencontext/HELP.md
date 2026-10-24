@@ -35,6 +35,17 @@ and from its own table otherwise; `context_window` overrides both. The harness n
 `claude`, `gemini_cli`, `pi`, `opencode`, `kilo`, `crush`, `openclaw`, `goose`, `kimi_code`,
 `hermes`, `nanobot`, `dsh`, `workbuddy` and `mini`.
 
+### Claude Code: its own hook, or the proxy
+
+Claude Code (2.1.294 or newer) runs the strategy through its own plugin hook by default: its
+endpoint and login stay as they are, so Remote Control (from the claude.ai or mobile app,
+`/remote-control`, `claude remote-control`) keeps working, as do the features Claude Code keeps for
+Anthropic's own endpoint. A strategy the hook cannot carry or was not checked on (`clm`, `acm`,
+`ace`, `mem1`, the RLMs) runs through the proxy, where Remote Control does not start: `opencontext
+strategy` moves Claude Code to the proxy for it, and back to the hook for one the hook runs, for
+the conversations started from then on. `opencontext status` shows the path; `--via proxy` keeps Claude
+Code on the proxy.
+
 ### Keeping OpenContext running
 
 A harness pointed at OpenContext reaches its model only through OpenContext. Where the harness can run a
@@ -75,7 +86,7 @@ history as the harness has it. Switching back finds the earlier strategy's conte
 
 | When | What changes |
 | --- | --- |
-| OpenContext already set up, strategy changed | Every conversation, from its next request |
+| OpenContext already set up, strategy changed | Every conversation, from its next request (one that moves Claude Code to the other path: new conversations) |
 | First `opencontext setup` | New conversations. Codex, Claude Code and the other harnesses read their config as a conversation starts: one already open goes on as it was, without OpenContext, until a new one is started. `codex exec resume` starts again on every turn, so it changes from its next turn. |
 | `opencontext uninstall <harness>` | New conversations go to the provider directly again: at once, or, while conversations that grew past the window through OpenContext still need it, as if direct through OpenContext until those are compacted (see "Checking and undoing"). One already open keeps going through OpenContext, which keeps running for it (until the machine restarts). |
 
@@ -83,7 +94,9 @@ history as the harness has it. Switching back finds the earlier strategy's conte
 
 1. Install it with the line under "Installing" (or `sh install.sh <checkout>`). This needs
    network access. Use `~/.local/bin/opencontext` if that folder is not on PATH.
-2. Run `opencontext setup <your harness> --strategy <name>` outside your sandbox: it writes the
+2. If you are Claude Code and the user uses Remote Control, tell them which strategies keep it
+   (see "Claude Code: its own hook, or the proxy") before choosing one that runs through the proxy.
+   Run `opencontext setup <your harness> --strategy <name>` outside your sandbox: it writes the
    harness's config in the home directory and starts OpenContext. Ask the user to approve it
    (in Codex, a command that runs with escalated permissions). Run it even when the harness's
    configuration looks empty or unusual. OpenContext knows where each harness keeps its settings,
@@ -170,5 +183,5 @@ cannot drive; mini-swe-agent has no compaction of its own (start a new conversat
 ## Other commands
 
     opencontext serve                    # run OpenContext in the foreground (what its daemon runs)
-    opencontext install <harness>        # only point a harness at OpenContext (`--via hook`: Claude Code's hook)
+    opencontext install <harness>        # only point a harness at OpenContext (`--via proxy|hook`: that path)
     opencontext run codex -- <args>      # one run through a private, temporary OpenContext
