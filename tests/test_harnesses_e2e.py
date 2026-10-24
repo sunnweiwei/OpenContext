@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from opencontext import Compaction, Engine, PrefixStore, ProxyConfig, create_app
+from opencontext import intercept
 from opencontext.integrations import ClaudeCodeHook
 from opencontext.prompts import SUMMARY_PREFIX
 from opencontext.strategies import ContextFolding
@@ -152,6 +153,82 @@ class ClaudeCodeHookTests(unittest.TestCase):
         self.assertIn("Branch has finished its task, the returned message is", last)
         self.assertNotIn("\\n49\\n50", last)  # (the branch's steps, folded away)
         self.assertEqual(self.compactions[0], 1)  # (the branch's echo was written as it came in; the fold compacted)
+
+
+class ClaudeCodeHookSwitchTests(unittest.TestCase):
+    """One open Claude Code session, the strategy changed between its turns (`opencontext strategy`)."""
+
+    def test_a_strategy_changed_mid_session_compacts_and_is_told(self) -> None:
+        if shutil.which("claude") is None:
+            self.skipTest("claude is not installed")
+        # (below Claude Code 2.1.309's own request with two files read, which is smaller than 2.1.294's)
+        engine = Engine(Compaction(threshold=14_000), PrefixStore())
+        fake = FakeUpstream(tool_calls=6, command="seq 1 300")
+        turns = "".join(json.dumps({"type": "user", "message": {"role": "user", "content": text}}) + "\n"
+                        for text in ("List the files.", "Do it again."))
+
+        def switch(request: dict[str, Any]) -> None:  # (between the turns, as `opencontext strategy folding` would)
+            if "Do it again." in json.dumps(request.get("body")) and engine.strategy.name == "compaction":
+                engine.strategy = ContextFolding(Compaction(threshold=14_000))
+
+        record = fake._record
+        fake._record = lambda request, body: (switch({"body": body}), record(request, body))[1]
+        with serve(fake.app) as upstream, tempfile.TemporaryDirectory() as root:
+            home, work = Path(root, "home"), Path(root, "work")
+            (home / ".claude").mkdir(parents=True), work.mkdir()
+            with serve(create_app(engine, ProxyConfig(upstreams={}))) as opencontext:
+                config: dict[str, Any] = {}
+                for setting in ClaudeCodeHook().installation(opencontext).settings:
+                    config.setdefault(setting.key[0], {})[setting.key[1]] = setting.value
+                (home / ".claude" / "settings.json").write_text(json.dumps(config))
+                env = {**_env(home), "ANTHROPIC_BASE_URL": upstream, "ANTHROPIC_API_KEY": "tenant"}
+                result = subprocess.run(["claude", "-p", "--input-format", "stream-json", "--output-format",
+                                         "stream-json", "--verbose", "--permission-mode", "bypassPermissions"],
+                                        cwd=work, env=env, input=turns, capture_output=True, text=True, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertEqual(engine.strategy.name, "folding")
+        bodies = [b for b in fake.bodies("/v1/messages") if b.get("tools")]
+        second = next(n for n, b in enumerate(bodies) if "Do it again." in json.dumps(b))
+        compacted = [n for n, b in enumerate(bodies) if any(SUMMARY_PREFIX in _text(m) for m in b["messages"])]
+        self.assertTrue([n for n in compacted if n > second + 1], "turn 2 never compacted")  # (folding's fallback)
+        toasts = [json.loads(line) for line in result.stdout.splitlines() if '"ui_toast"' in line]
+        self.assertTrue(any("OpenContext now runs folding" in t.get("text", "") for t in toasts), toasts)
+
+
+class ClaudeCodeHttpsTests(unittest.TestCase):
+    """Claude Code through OpenContext as its HTTPS proxy: its base URL stays api.anthropic.com, OpenContext
+    opens those connections and manages each request as through the proxy (here the fake answers
+    for api.anthropic.com); Claude Code's own transcript is never touched."""
+
+    def test_requests_are_compacted_and_claude_codes_transcript_is_its_own(self) -> None:
+        if shutil.which("claude") is None:
+            self.skipTest("claude is not installed")
+        fake = FakeUpstream(tool_calls=6, command="seq 1 300")
+        with serve(fake.app) as upstream, tempfile.TemporaryDirectory() as root:
+            home, work = Path(root, "home"), Path(root, "work")
+            (home / ".claude").mkdir(parents=True), work.mkdir()
+            os.environ["OPENCONTEXT_HOME"] = str(Path(root, "opencontext"))  # (the CA, in this test's OpenContext directory)
+            # (below Claude Code's own request with a few results: on Anthropic's endpoint it is smaller)
+            engine = Engine(Compaction(threshold=12_000), PrefixStore())
+            with serve(create_app(engine, ProxyConfig(upstreams=local_upstreams(upstream)))) as opencontext:
+                from tests.test_intercept import _listener
+                proxy, _ = _listener(lambda: intercept.serve("127.0.0.1", 0, int(opencontext.rsplit(":", 1)[1])))
+                (home / ".claude" / "settings.json").write_text(json.dumps({"env": {
+                    "HTTPS_PROXY": f"http://127.0.0.1:{proxy}", "NODE_EXTRA_CA_CERTS": str(intercept.ca_file())}}))
+                env = {**_env(home), "ANTHROPIC_API_KEY": "tenant"}  # (no ANTHROPIC_BASE_URL)
+                for command in _commands("claude", work):
+                    result = subprocess.run(command, cwd=work, env=env, stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=180)
+                    self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+                    self.assertIn(FINAL_TEXT, result.stdout)
+            transcript = "".join(path.read_text() for path in (home / ".claude" / "projects").rglob("*.jsonl"))
+        requests = [r for r in fake.requests if isinstance(r.get("body"), dict) and r["body"].get("tools")]
+        self.assertTrue(requests)
+        self.assertIn("prompt-caching-scope", requests[0]["headers"].get("anthropic-beta", ""))  # (Anthropic's own)
+        self.assertTrue(any(any(SUMMARY_PREFIX in _text(m) for m in r["body"]["messages"]) for r in requests))
+        self.assertFalse([r for r in requests if "thread" in r["body"]])  # (no server-side thread: OpenContext sees it all)
+        self.assertNotIn("compact_boundary", transcript)  # (Claude Code never compacted: it saw nothing)
+        self.assertNotIn(SUMMARY_PREFIX, transcript)
 
 
 def _size(body: dict[str, Any]) -> int:

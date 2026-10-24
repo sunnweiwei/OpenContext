@@ -186,6 +186,31 @@ carries. Each harness lists its paths in order of preference; `opencontext insta
 runs on (one installed `--via auto`, the preferred one; one on a named path, that one unless it
 cannot), for the conversations started from then on; `opencontext status` shows each harness's path.
 
+**Claude Code through OpenContext as its HTTPS proxy** (its default path, Claude Code 2.1.294+; `opencontext/intercept.py`):
+Claude Code's base URL stays api.anthropic.com and its own settings get `HTTPS_PROXY` (OpenContext's
+proxy, its `intercept_port`) and `NODE_EXTRA_CA_CERTS` (OpenContext's CA), the way an organization's
+proxy is set. OpenContext opens the connections to api.anthropic.com with a certificate of its CA and
+manages each request as through the proxy (every path of that host goes to Anthropic, Remote
+Control's included); it tunnels every other connection as it is (Remote Control's bridge, a tool's
+download). So Remote Control and what Claude Code keeps for Anthropic's own endpoint stay on, every
+strategy runs, and Claude Code's transcript is never touched: neither Claude Code nor whoever
+watches it sees the context management, as through the proxy. The CA can vouch for api.anthropic.com
+alone (a critical name constraint, which Claude Code enforces: a certificate of it for another
+host is refused, "permitted subtree violation"), its keys are readable by their owner only, and it
+lives in OpenContext's directory, nowhere in the system's trust. The commands Claude Code runs inherit
+the proxy, as they would an organization's: OpenContext tunnels them as they are, and they reach the
+network only while OpenContext runs. A proxy Claude Code already goes through is not chained to (the path
+is unavailable then), and CAs it already trusts are kept beside OpenContext's. On Anthropic's own endpoint
+Claude Code (2.1.309) keeps the conversation in a server-side thread and sends only what is new;
+OpenContext answers a request that asks for one as a server without threads does
+(`thread_unsupported_request`), and Claude Code sends that turn again without, and its whole
+conversation from then on (it keeps the session, on that model, without threads). Checked through it with Claude on the real API
+(the table below; `acm` and `mem1` met Anthropic's refusals on its own endpoint, category
+`reasoning_extraction`, for the prompts ACM recalls with and MEM1's internal state; `ace` failed on
+Claude through the proxy too). Remote Control's own checks were played with a made-up login and no
+network (Claude Code 2.1.309): through the HTTPS proxy it
+passed the endpoint check and stopped at the account, through a base URL it was refused there.
+
 **Claude Code's compaction hook** (Claude Code 2.1.294+, `opencontext setup claude --via hook`): the install enables
 a function-hook plugin (Claude Code's plugin API, early access, switched on by
 `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS`) and leaves `ANTHROPIC_BASE_URL` alone, so Remote Control
@@ -203,7 +228,11 @@ changes (Context Folding's branch) is written as it comes in (`tool.call`, befor
 stores it), so that is no compaction: a branch costs one, at its return. The strategy's instructions join the end of the system
 prompt (its last section, `context_management`, through `prompt.section`) from
 `/opencontext/v1/instructions`: Claude Code builds its system prompt once a session, so instructions that
-change within one (ACE's playbook) are the proxy's, as are notes for one request (CLM, ACM) and a
+change within one (ACE's playbook) are the proxy's, and a strategy changed while a session is open
+(`opencontext strategy`) decides that session's compactions from its next request but has its
+instructions there from the next session (the plugin says so, once: a toast, which a headless
+session emits as a `ui_toast` event, and a notification; one the hook cannot carry leaves the open
+session to compact on its own, and says that), as are notes for one request (CLM, ACM) and a
 completion of the strategy's own (ACE, RLM). Claude Code stops a session that compacts three times with fewer than three
 requests between them (its thrashing breaker, which no plugin reaches), so a strategy that changes
 the context on every request (MEM1) is the proxy's too; Self-Compact through the hook needs the
@@ -257,6 +286,12 @@ has none of them; on the hook it keeps them, where it reaches Anthropic directly
 | `claude_code` | hook | `autocompact` | 2.1.294–2.1.309 |
 | `claude_code` | hook | `prolong` | 2.1.294–2.1.309 |
 | `claude_code` | hook | `selfcompact` | 2.1.309 |
+| `claude_code` | https | `compaction` | 2.1.294–2.1.309 |
+| `claude_code` | https | `folding` | 2.1.294–2.1.309 |
+| `claude_code` | https | `clm` | 2.1.294–2.1.309 |
+| `claude_code` | https | `autocompact` | 2.1.294–2.1.309 |
+| `claude_code` | https | `prolong` | 2.1.294–2.1.309 |
+| `claude_code` | https | `selfcompact` | 2.1.294–2.1.309 |
 
 Checked in Docker (`check.py --via hook claude_code:gpt`, OpenContext off the model path and a second,
 non-compacting OpenContext recording it): Claude Code asked before every request and the strategy

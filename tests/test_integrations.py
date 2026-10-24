@@ -44,8 +44,14 @@ RELEASE = "opencontext.integrations.claude_code.installed_release"
 class PathTests(unittest.TestCase):
     def test_auto_takes_the_preferred_path_that_runs_the_strategy(self) -> None:
         claude, pi = HARNESSES["claude_code"], HARNESSES["pi"]
-        hook = integrations.HOOKS["claude_code"]
-        with patch(RELEASE, return_value="2.1.309"), patch.object(type(hook), "preferred", True):
+        hook, https = integrations.HOOKS["claude_code"], integrations.HTTPS["claude_code"]
+        with patch(RELEASE, return_value="2.1.309"):
+            self.assertEqual(integrations.choose(claude).name, "https")  # (Claude Code's default)
+            self.assertEqual(integrations.choose(claude, "auto", "clm").name, "https")
+            self.assertEqual(integrations.choose(claude, "auto", "mem1").name, "proxy")  # (checked on neither)
+        with patch(RELEASE, return_value="2.1.309"), patch.object(type(https), "unavailable", lambda self: "a proxy"):
+            self.assertEqual(integrations.choose(claude).name, "hook")  # (the HTTPS proxy unavailable: the hook)
+        with patch(RELEASE, return_value="2.1.309"), patch.object(type(https), "preferred", False):
             self.assertEqual(integrations.choose(claude).name, "hook")  # (once preferred: before the proxy)
             self.assertEqual(integrations.choose(claude, "auto", "folding").name, "hook")
             self.assertEqual(integrations.choose(claude, "auto", "clm").name, "proxy")  # (notes for one request)
@@ -53,15 +59,14 @@ class PathTests(unittest.TestCase):
             with patch.object(type(hook), "checked", {"compaction": "2.1.294"}):
                 self.assertEqual(integrations.choose(claude, "auto", "folding").name, "proxy")  # (not checked on it)
                 self.assertEqual(integrations.choose(claude, "hook", "folding").name, "hook")  # (named: taken)
-        with patch(RELEASE, return_value="2.1.309"):
-            self.assertEqual(integrations.choose(claude).name, "hook")  # (Claude Code's is preferred)
-        with patch(RELEASE, return_value="2.1.309"), patch.object(type(hook), "preferred", False):
+        with patch(RELEASE, return_value="2.1.309"), patch.object(type(https), "preferred", False), \
+                patch.object(type(hook), "preferred", False):
             self.assertEqual(integrations.choose(claude).name, "proxy")  # (a hook not preferred: when named)
             self.assertEqual(integrations.choose(claude, "hook").name, "hook")
             self.assertEqual(integrations.choose(claude, "proxy").name, "proxy")
             with self.assertRaisesRegex(ValueError, "clm needs notes, which the hook cannot carry"):
                 integrations.choose(claude, "hook", "clm")
-        with patch(RELEASE, return_value="2.1.250"), patch.object(type(hook), "preferred", True):
+        with patch(RELEASE, return_value="2.1.250"), patch.object(type(https), "preferred", False):
             self.assertEqual(integrations.choose(claude).name, "proxy")
             with self.assertRaisesRegex(ValueError, "older than 2.1.294"):
                 integrations.choose(claude, "hook")
@@ -76,7 +81,7 @@ class PathTests(unittest.TestCase):
 
     def test_a_hook_is_checked_only_with_what_it_carries_and_the_design_doc_says_so(self) -> None:
         readme = (Path(__file__).parents[1] / "docs" / "design.md").read_text()
-        for name, hook in integrations.HOOKS.items():
+        for name, hook in [*integrations.HOOKS.items(), *integrations.HTTPS.items()]:
             for strategy, releases in hook.checked.items():
                 self.assertIsNone(integrations.uncarried(hook, strategy), strategy)
                 self.assertRegex(readme, rf"\| `{name}` \| {hook.name} \| `{strategy}` \| {re.escape(releases)} \|")
@@ -201,7 +206,6 @@ class ClaudeCodeCompactTests(unittest.TestCase):
         messages = [user("read"), call(1), result(1)]
         for answer, refused in [
             (lambda r: Context(r.current, notes=("size",)), "notes"),
-            (lambda r: Context((Item(Kind.SYSTEM, "rules"), *r.current[:2])), "instructions are not the ones"),
             (lambda r: Context((r.current[0], replace(r.current[1], text="Read {}"), r.current[2])), "change a tool call"),
             (lambda r: Context((r.current[0], replace(r.current[1], kind=Kind.ASSISTANT), r.current[2])), "keeps a message"),
         ]:
@@ -310,6 +314,15 @@ class ClaudeCodeCompactTests(unittest.TestCase):
                          {"skip": "compaction: held, two compactions in a row would end Claude Code's turn"})
         self.assertIn("summarize", ClaudeCodeHook().compact(engine, {**request, "tokens": 168_000}))  # (forced)
 
+    def test_a_strategy_changed_mid_session_runs_at_once_and_says_its_instructions_wait(self) -> None:
+        messages = [user("read"), call(1), result(1), call(2), result(2)]
+        engine = Engine(Answers(lambda r: Context((Item(Kind.SYSTEM, "new rules"), r.current[0], *r.current[3:]))))
+        done = ClaudeCodeHook().compact(engine, {"messages": messages, "instructions": "old rules"})
+        self.assertEqual(done["messages"], [{"ref": 0}, {"ref": 3}, {"ref": 4}])  # (the new strategy's context)
+        self.assertIn("its instructions reach Claude Code's system prompt in a new session", done["notice"])
+        same = ClaudeCodeHook().compact(engine, {"messages": messages, "instructions": "new rules"})
+        self.assertNotIn("notice", same)
+
     def test_the_instructions_are_the_strategys_own(self) -> None:
         self.assertIn("internal state", ClaudeCodeHook().instructions(Engine(MEM1())))
         self.assertIn("branch", ClaudeCodeHook().instructions(Engine(ContextFolding())).lower())
@@ -347,6 +360,7 @@ class EndpointTests(unittest.TestCase):
             "/opencontext/v1/instructions", json={"harness": "claude_code"})
         self.assertEqual(refused.status_code, 409)
         self.assertIn("clm needs notes, which the hook cannot carry", refused.json()["error"]["message"])
+        self.assertIn("this one compacts on its own", refused.json()["notice"])  # (shown once in the session)
 
 
 if __name__ == "__main__":

@@ -30,7 +30,10 @@ def hook_routes(engine: Engine, follow: Callable[[], None], noted: Callable[[str
             if payload.get("version"):
                 noted(name, payload["version"])
             if why := uncarried(hook, engine.strategy.name):  # (`opencontext strategy` moves the harness to the proxy)
-                return JSONResponse({"error": {"message": f"opencontext: {why}; it runs through the proxy"}}, 409)
+                notice = (f"OpenContext: {why}, so it runs through the proxy, for new sessions; this one "
+                          f"compacts on its own")
+                return JSONResponse({"error": {"message": f"opencontext: {why}; it runs through the proxy"},
+                                     "notice": notice}, 409)
             if kind == "instructions":
                 return JSONResponse({"instructions": await run_in_threadpool(hook.instructions, engine)})
             if kind == "result":
