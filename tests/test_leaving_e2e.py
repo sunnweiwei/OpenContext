@@ -99,7 +99,7 @@ class LeavingTests(unittest.TestCase):
         self.assertIn("codex is leaving OpenContext", out)
         self.assertIn('"read the logs, part 0"', out)  # the conversation that would fail direct
         self.assertIn("/up/codex-0", self.config.read_text())  # still through OpenContext
-        self.assertIn("leaving OpenContext: codex", self.opencontext("status"))
+        self.assertIn("leaving OpenContext (uninstall not finished): codex", self.opencontext("status"))
         self.turn(app, thread, "while leaving")  # OpenContext keeps it working
 
         app.done("thread/compact/start", {"threadId": thread})  # Codex's own compaction, through OpenContext

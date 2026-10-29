@@ -113,7 +113,12 @@ So `opencontext uninstall` restores a harness at once only when none of its rece
 past the window through OpenContext. Otherwise it leaves in two steps (`opencontext/leaving.py`): it stays
 pointed at OpenContext, which forwards each request whose history fits the window as the harness sent
 it (`Engine.prepare(direct_within=...)`, as going direct would) and keeps managing the others;
-`opencontext uninstall` names those and says to run the harness's own `/compact` in them. A compaction
+`opencontext uninstall` names those, says it is not finished, and lists the choices: the harness's own
+`/compact` in them (with the command that runs it where the harness has one: Claude Code's
+`claude --resume <session> -p "/compact"`), waiting, or `--now`, and asks an agent running it to put
+them to its user. A conversation is judged by the window the harness allows now, so one recorded
+before it (with a smaller window) is not held back; one recorded before conversations were named
+apart from the strategy is handed back by the harness and what its user first typed. A compaction
 of the harness's own hands its conversation back. Once no conversation needs OpenContext, or each was
 last used a week ago, the harness's configuration is restored: by the OpenContext serving it, or by the
 next `opencontext status` or `opencontext start`. OpenContext remembers the conversations it served for that week
@@ -509,8 +514,16 @@ returned codes and neither file's text, and the model answered right and no long
 the request after the fold the upstream's cache served 69% to 98% of the prompt where it reports
 cache use (Codex 86%, Claude Code 89%, Gemini CLI on Gemini 72%). Gemini CLI on GPT, which had not
 been told about branches (see the LiteLLM note under CLM), used its own sub-agent tool
-(`invoke_agent`); told, it branches and folds too. Codex at times reaches for its `spawn_agent`. The signal is read from the echo's output in whatever
-form a harness reports it (plain, JSON, `Command: … Output: …`), else from the call.
+(`invoke_agent`); told, it branches and folds too. Codex at times reaches for its `spawn_agent`. A
+signal is a lone echo of it in a tool's input (one argument, nothing after it), read from the
+echo's output in whatever form a harness reports it (plain, JSON, `Command: … Output: …`), else,
+where the call reports no output, from the command; text that only mentions it (the model's,
+another tool's input, a grep for it) is none. The guidance asks for the echo as the only tool
+call of its response (as for AutoCompact's and ACM's signals); one beside other calls is ignored,
+and the model is told so: in the echo's own result where it has one (Codex, Chat Completions,
+Claude Code's hook; of several results, the one saying what the echo printed, in whatever order
+they come), else, where one message answers all the calls (Anthropic Messages, Gemini), in a note
+on the request right after. The other calls' results stay as they were.
 
 ## PRO-LONG
 

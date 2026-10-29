@@ -154,6 +154,30 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(upstream.requests, [])  # (no strategy, no summary)
         self.assertTrue(self.prepare(body(*history), upstream, direct_within=100).compacted)  # too long: managed
 
+    def test_a_conversation_keeps_a_lasting_name_across_strategies(self) -> None:
+        history = [msg("user", "fix it"), *step(1), *step(2)]
+        first = self.prepare(body(*history), Upstream())
+        self.engine = Engine(Compaction(threshold=900, min_gain=0), store=self.engine.store)  # another strategy
+        second = self.prepare(body(*history, *step(3, size=10)), Upstream())
+        self.assertNotEqual(first.conversation, second.conversation)  # (as strategies see it: theirs)
+        self.assertEqual(first.lasting, second.lasting)
+        self.assertNotEqual(self.prepare(body(msg("user", "another task"), *step(1)), Upstream()).lasting, first.lasting)
+
+    def test_the_harness_compacting_after_a_strategy_change_gets_the_context_last_seen(self) -> None:
+        class Compacting(Harness):
+            compaction_prompts = ("summarize your history",)
+
+        history = [msg("user", "fix it"), *step(1), *step(2)]
+        compacted = self.engine.prepare(CODEC, Compacting(), body(*history), tenant="t", post=Upstream())
+        self.assertTrue(compacted.compacted)
+        self.engine = Engine(Compaction(threshold=100_000, min_gain=0), store=self.engine.store)  # another strategy
+        upstream = Upstream()
+        own = self.engine.prepare(CODEC, Compacting(), body(*history, msg("user", "summarize your history")),
+                                  tenant="t", post=upstream)
+        self.assertTrue(own.compacting)
+        self.assertEqual(upstream.requests, [])  # (no summary of OpenContext's own)
+        self.assertEqual(own.body["input"][:-1], compacted.body["input"])  # what the model last saw, then the prompt
+
     def test_reported_usage_anchors_the_next_estimate(self) -> None:
         upstream = Upstream()
         history = [msg("user", "task"), *step(1, size=10)]
@@ -303,6 +327,105 @@ class EngineTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+WASTED = "Wasted call — file unchanged since your last Read. Refer to that earlier tool_result instead."
+
+
+class Folds:
+    """Folds the given reads away, as Context Folding folds a branch's steps (their call and result go)."""
+
+    name = "folds"
+
+    def __init__(self, *texts: str) -> None:
+        self.texts = texts
+
+    def fingerprint(self) -> dict[str, Any]:
+        return {"name": self.name, "texts": self.texts}
+
+    def plan(self, request: Any, summarizer: Any) -> Context | None:
+        items = list(request.current)
+        gone = {n for n, item in enumerate(items) if item.kind is Kind.TOOL_RESULT and any(t in item.text for t in self.texts)}
+        return Context(tuple(item for n, item in enumerate(items) if n not in gone and n + 1 not in gone)) if gone else None
+
+
+class ReadRecallTests(unittest.TestCase):
+    """Claude Code answers a Read of a file unchanged since an earlier Read with a pointer to that
+    result: where OpenContext no longer shows it, its text answers the Read again."""
+
+    def send(self, strategy: Any, *messages: dict[str, Any]) -> list[dict[str, Any]]:
+        return Engine(strategy, PrefixStore()).prepare(AnthropicMessages(), ClaudeCode(), {
+            "model": "m", "messages": [{"role": "user", "content": "read models.py"}, *messages],
+            "tools": [{"name": "Read"}]}, tenant="t", post=lambda r: (500, {})).body["messages"]
+
+    @staticmethod
+    def read(i: str, text: str, path: str = "models.py", **more: Any) -> list[dict[str, Any]]:
+        return [{"role": "assistant", "content": [{"type": "tool_use", "id": i, "name": "Read", "input": {"file_path": path, **more}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": i, "content": text}]}]
+
+    def test_a_read_answered_by_an_earlier_result_opencontext_folded_away_gets_its_text(self) -> None:
+        history = [*self.read("r1", "MODELS TEXT"), *self.read("r2", WASTED)]
+        sent = self.send(Folds("MODELS TEXT"), *history)
+        self.assertNotIn("r1", json.dumps(sent))  # folded away
+        self.assertEqual(sent[-1]["content"][0]["content"], [{"type": "text", "text": "MODELS TEXT"}])
+
+    def test_a_read_whose_earlier_result_the_model_still_sees_stays_as_it_was(self) -> None:
+        history = [*self.read("r1", "MODELS TEXT"), *self.read("r2", WASTED)]
+        self.assertEqual(self.send(Compaction(threshold=10**9), *history)[-1], history[-1])
+
+    def test_a_read_that_would_not_fit_the_window_stays_the_pointer(self) -> None:
+        history = [*self.read("r1", "MODELS TEXT " * 2_000), *self.read("r2", WASTED)]
+        engine = Engine(Folds("MODELS TEXT"), PrefixStore(), window=4_000)  # (the file is ~6k tokens)
+        sent = engine.prepare(AnthropicMessages(), ClaudeCode(), {
+            "model": "m", "messages": [{"role": "user", "content": "read models.py"}, *history],
+            "tools": [{"name": "Read"}]}, tenant="t", post=lambda r: (500, {})).body["messages"]
+        self.assertEqual(sent[-1], history[-1])
+        self.assertEqual(self.send(Folds("MODELS TEXT"), *history)[-1]["content"][0]["content"][0]["text"][:11], "MODELS TEXT")
+
+    def test_only_the_same_read_counts(self) -> None:
+        history = [*self.read("r1", "MODELS TEXT"), *self.read("r2", WASTED, offset=100)]
+        self.assertEqual(self.send(Folds("MODELS TEXT"), *history)[-1], history[-1])
+
+    def test_an_image_read_goes_back_whole(self) -> None:
+        image = [{"type": "text", "text": "SHOT TEXT"},
+                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}]
+        history = [*self.read("r1", image, "shot.png"), *self.read("r2", WASTED, "shot.png")]
+        sent = self.send(Folds("SHOT TEXT"), *history)[-1]["content"][0]["content"]
+        self.assertEqual([b["type"] for b in sent], ["text", "image"])  # its text and its image
+        self.assertIn("SHOT TEXT", sent[0]["text"])
+        self.assertEqual(sent[1]["source"]["data"], "aGk=")
+
+    def test_a_result_that_cannot_go_back_whole_stays_the_pointer(self) -> None:
+        # The image of one of two results answered in one message is not that result's alone (an
+        # item's media are the message's): it does not go back, and the pointer stays.
+        image = [{"type": "text", "text": "SHOT TEXT"},
+                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}]
+        calls = {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "shot.png"}},
+            {"type": "tool_use", "id": "x", "name": "Read", "input": {"file_path": "exceptions.py"}}]}
+        results = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "r1", "content": image},
+                                               {"type": "tool_result", "tool_use_id": "x", "content": "EXCEPTIONS TEXT"}]}
+        history = [calls, results, *self.read("r2", WASTED, "shot.png")]
+        self.assertEqual(self.send(Folds("SHOT TEXT"), *history)[-1], history[-1])
+
+    def test_pointers_answered_beside_others_stay_as_they_were(self) -> None:
+        # One item answers both calls: a pointer among them does not go back.
+        calls = {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "r3", "name": "Read", "input": {"file_path": "models.py"}},
+            {"type": "tool_use", "id": "r4", "name": "Read", "input": {"file_path": "adapters.py"}}]}
+        results = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "r4", "content": WASTED},
+                                               {"type": "tool_result", "tool_use_id": "r3", "content": WASTED}]}
+        history = [*self.read("r1", "MODELS TEXT"), *self.read("r2", "ADAPTERS TEXT", "adapters.py"), calls, results]
+        self.assertEqual(self.send(Folds("MODELS TEXT", "ADAPTERS TEXT"), *history)[-1], results)
+
+    def test_an_earlier_result_answered_beside_others_answers_a_read_again(self) -> None:
+        # Found by the call it answers, in the order Claude Code sends results (as they finished).
+        calls = {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "models.py"}},
+            {"type": "tool_use", "id": "x", "name": "Read", "input": {"file_path": "exceptions.py"}}]}
+        results = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": "EXCEPTIONS TEXT"},
+                                               {"type": "tool_result", "tool_use_id": "r1", "content": "MODELS TEXT"}]}
+        sent = self.send(Folds("MODELS TEXT"), calls, results, *self.read("r2", WASTED))
+        self.assertEqual(sent[-1]["content"][0]["content"], [{"type": "text", "text": "MODELS TEXT"}])
 
 class InitialContextTests(unittest.TestCase):
     def test_initial_context_survives_repeated_compaction_in_codex_layout(self) -> None:

@@ -43,6 +43,9 @@ class Harness:
     injected: tuple[re.Pattern[str], ...] = (REMINDER,)  # blocks the harness writes into user messages
     summaries: tuple[str, ...] = ()  # how the summaries of its own compaction start (Codex's: every harness)
     compaction_prompts: tuple[str, ...] = ()  # what its own compaction asks of the model, in its last message
+    # A history up to this size goes direct when the harness leaves OpenContext, where the model catalog
+    # knows a smaller window than the harness uses (`opencontext uninstall`: see opencontext/leaving.py).
+    direct_window: int | None = None
     # The releases of the harness this profile was checked against (oldest–newest), and its release
     # in the User-Agent it sends, where it sends one. A newer release is served as the newest one.
     verified: str = ""
@@ -173,9 +176,28 @@ class Harness:
             return item
         return replace(item, text=text) if text or item.media else None
 
+    def recalled(self, items: list[Item], originals: list[Item], raw: list[WireItem]) -> list[Item]:
+        """`items` (the context as it will be sent) with what the harness's tools answered from its
+        own history of the conversation (`originals`, as sent: `raw`), where that is no longer in
+        the context, answered again (a harness that tells the model to refer to an earlier result).
+        `items` itself where nothing changes."""
+
+        return items
+
     def window(self, model: str | None) -> int | None:
         """The model's context window as the harness itself knows it (its model catalog), if it
         does: OpenContext compacts where the harness would."""
+
+        return None
+
+    def session(self, headers: Mapping[str, str]) -> str:
+        """The harness's own name for the conversation a request belongs to, where it sends one."""
+
+        return ""
+
+    def compacts(self, session: str) -> str | None:
+        """The command that has the harness compact that conversation by itself (its own `/compact`,
+        run without its interface), where it has one."""
 
         return None
 

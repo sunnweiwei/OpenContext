@@ -6,9 +6,10 @@ from typing import Any
 
 from opencontext.core.engine import Engine
 from opencontext.harnesses import Harness
-from opencontext.protocols import Gemini, OpenAIResponses
+from opencontext.protocols import AnthropicMessages, Gemini, OpenAIChat, OpenAIResponses
 from opencontext.strategies import Compaction, ContextFolding
-from opencontext.strategies.folding import NESTED, RETURNED
+from opencontext.strategies.conversation import IGNORED
+from opencontext.strategies.folding import BRANCH as BRANCH_MESSAGE, NESTED, RETURNED
 
 CODEC, HARNESS = OpenAIResponses(), Harness()
 TOOLS = [{"type": "function", "name": "sh", "parameters": {}}]
@@ -79,6 +80,155 @@ class FoldingTests(unittest.TestCase):
         self.send(*self.history, *branch)
         items = self.send(*self.history, *branch, *read(2), *ret).body["input"]
         self.assertEqual(self.text(items[-1]), RETURNED.format(message="file_2: c2"))
+
+    def test_a_return_keeps_every_line_of_its_message(self) -> None:
+        # Claude Code reports `echo "[return] line\nline"` as the lines the echo printed.
+        ret = run(11, 'echo "[return] file_2: c2\nfile_3: c3"', "[return] file_2: c2\nfile_3: c3\nnothing pending")
+        self.send(*self.history, *BRANCH)
+        items = self.send(*self.history, *BRANCH, *read(2), *read(3), *ret).body["input"]
+        self.assertEqual(self.text(items[-1]), RETURNED.format(message="file_2: c2\nfile_3: c3\nnothing pending"))
+
+    def test_a_branch_beside_other_calls_of_their_own_is_answered_that_it_was_ignored(self) -> None:
+        # Codex: an item per parallel call, then their outputs; a grep beside the echo finds the signal too.
+        grep = run(9, 'grep -rn "branch" notes.md', "notes.md:3:[branch] Old :: an old note")
+        beside = [BRANCH[0], grep[0], grep[1], BRANCH[1]]
+        sent = self.send(*self.history, *beside).body["input"]
+        self.assertEqual(sent[-4:-1], [BRANCH[0], grep[0], grep[1]])
+        self.assertEqual(self.text(sent[-1]), IGNORED.format(name="branch"))
+        self.assertEqual(sent[-1]["call_id"], "c10")
+        # Run again alone, it opens; the one ignored stays answered so.
+        alone = run(12, 'echo "[branch] Read files :: read file_2"', "[branch] Read files :: read file_2")
+        later = self.send(*self.history, *beside, *alone).body["input"]
+        self.assertEqual(self.text(later[-3]), IGNORED.format(name="branch"))
+        self.assertTrue(self.text(later[-1]).startswith("ROLE CHANGE"))
+
+    def test_a_branch_beside_other_calls_is_ignored_and_the_model_told(self) -> None:
+        # Claude Code answers parallel tool uses in one message, in its own order.
+        codec = AnthropicMessages()
+
+        def use(i: str, name: str, command: str) -> dict[str, Any]:
+            return {"type": "tool_use", "id": i, "name": name, "input": {"command": command}}
+
+        def result(i: str, text: str) -> dict[str, Any]:
+            return {"type": "tool_result", "tool_use_id": i, "content": text}
+
+        task = {"role": "user", "content": "investigate the files"}
+        calls = {"role": "assistant", "content": [use("b", "Bash", 'echo "[branch] Read models :: read models.py"'),
+                                                  use("x", "Read", "exceptions.py"), use("y", "Read", "models.py")]}
+        results = {"role": "user", "content": [result("x", "EXCEPTIONS TEXT"), result("b", "[branch] Read models :: read models.py"),
+                                               result("y", "MODELS TEXT")]}
+
+        def send(*messages: dict[str, Any]) -> Any:
+            return self.engine.prepare(codec, HARNESS, {"model": "m", "messages": list(messages), "tools": [{"name": "Bash"}]},
+                                       tenant="a", post=lambda r: (500, {})).body["messages"]
+
+        sent = send(task, calls, results)
+        self.assertEqual(sent[-1]["content"][:3], results["content"])  # each result as it was
+        self.assertEqual(sent[-1]["content"][3], {"type": "text", "text": IGNORED.format(name="branch")})
+        # Told once: on the request after, the step is as the harness sent it; run alone, the echo opens a branch.
+        alone = [{"role": "assistant", "content": [use("c", "Bash", 'echo "[branch] Read models :: read models.py"')]},
+                 {"role": "user", "content": [result("c", "[branch] Read models :: read models.py")]}]
+        later = send(task, calls, results, *alone)
+        self.assertEqual(later[2], results)
+        self.assertIn(BRANCH_MESSAGE.split("\n")[0], json.dumps(later[-1]))
+
+    def test_a_signal_the_model_only_mentions_beside_its_calls_opens_nothing(self) -> None:
+        # Claude Code (trace 394): the model explains, in the text beside two reads, why it cannot open
+        # a branch in the same step; the reads answer with the files.
+        codec = AnthropicMessages()
+        task = {"role": "user", "content": "open a branch beside the reads"}
+        calls = {"role": "assistant", "content": [
+            {"type": "text", "text": '分支的 `echo "[branch] ..."` 必须单独发出，不能和别的调用放在同一步。'},
+            {"type": "tool_use", "id": "x", "name": "Read", "input": {"file_path": "exceptions.py"}},
+            {"type": "tool_use", "id": "y", "name": "Read", "input": {"file_path": "adapters.py"}}]}
+        results = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": "EXCEPTIONS TEXT"},
+                                               {"type": "tool_result", "tool_use_id": "y", "content": "ADAPTERS TEXT"}]}
+        sent = self.engine.prepare(codec, HARNESS, {"model": "m", "messages": [task, calls, results], "tools": [{"name": "Bash"}]},
+                                   tenant="a", post=lambda r: (500, {})).body["messages"]
+        self.assertEqual(sent[-1], results)
+        # Chat Completions: one assistant message holds the text and the calls too.
+        codec = OpenAIChat()
+        messages = [{"role": "user", "content": "read the files"},
+                    {"role": "assistant", "content": 'I will open a branch later with echo "[branch] Read :: read file_2".',
+                     "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "sh", "arguments": '{"cmd": "cat file_1.txt"}'}}]},
+                    {"role": "tool", "tool_call_id": "c1", "content": "file 1 text"}]
+        sent = self.engine.prepare(codec, HARNESS, {"model": "m", "messages": messages, "tools": [{}]}, tenant="a",
+                                   post=lambda r: (500, {})).body["messages"]
+        self.assertEqual(sent[-1], messages[-1])
+        # The echo itself still opens one, the text beside it or not.
+        messages[1] = {**messages[1], "tool_calls": [{"id": "c1", "type": "function", "function": {
+            "name": "sh", "arguments": json.dumps({"cmd": 'echo "[branch] Read :: read file_2"'})}}]}
+        messages[2] = {"role": "tool", "tool_call_id": "c1", "content": "[branch] Read :: read file_2"}
+        sent = self.engine.prepare(codec, HARNESS, {"model": "m", "messages": messages, "tools": [{}]}, tenant="a",
+                                   post=lambda r: (500, {})).body["messages"]
+        self.assertIn("ROLE CHANGE", json.dumps(sent[-1]))
+
+    def test_a_return_after_a_branch_that_was_ignored_folds_nothing(self) -> None:
+        # Claude Code: its own context (reminders) leads the history; the branch beside other calls
+        # was ignored, so the return has no branch to fold.
+        from opencontext.harnesses import ClaudeCode
+        codec, harness = AnthropicMessages(), ClaudeCode()
+
+        def use(i: str, command: str) -> dict[str, Any]:
+            return {"type": "tool_use", "id": i, "name": "Bash", "input": {"command": command}}
+
+        def result(i: str, text: str) -> dict[str, Any]:
+            return {"type": "tool_result", "tool_use_id": i, "content": text}
+
+        task = {"role": "user", "content": [{"type": "text", "text": "<system-reminder>\nCodebase and user instructions are shown below. Be sure to adhere to these instructions.\n</system-reminder>"},
+                                            {"type": "text", "text": "investigate the files"}]}
+        calls = {"role": "assistant", "content": [use("x", "cat exceptions.py"), use("b", 'echo "[branch] Read models :: read models.py"'),
+                                                  use("y", "cat models.py")]}
+        results = {"role": "user", "content": [result("x", "EXCEPTIONS TEXT"), result("b", "[branch] Read models :: read models.py"),
+                                               result("y", "MODELS TEXT")]}
+        step = [{"role": "assistant", "content": [use("s", "cat more.py")]}, {"role": "user", "content": [result("s", "MORE TEXT")]}]
+        ret = [{"role": "assistant", "content": [use("r", 'echo "[return] models: 1180 lines"')]},
+               {"role": "user", "content": [result("r", "[return] models: 1180 lines")]}]
+
+        def send(*messages: dict[str, Any]) -> Any:
+            return self.engine.prepare(codec, harness, {"model": "m", "messages": list(messages), "tools": [{"name": "Bash"}]},
+                                       tenant="a", post=lambda r: (500, {}))
+
+        tokens = {"role": "system", "content": "<total_tokens>900000 tokens left</total_tokens>"}  # (after each step)
+        send(task, tokens, calls, results, tokens)
+        send(task, tokens, calls, results, tokens, *step, tokens)
+        history = [task, tokens, calls, results, tokens, *step, tokens, *ret]
+        sent = send(*history)
+        self.assertFalse(sent.compacted)
+        self.assertEqual(sent.body["messages"], history)
+
+    def test_a_signal_in_another_tools_input_opens_nothing(self) -> None:
+        # Claude Code (trace 458): the model hands a sub-agent a task that tells it how to branch; the
+        # Agent call's input holds the signal, its result is the sub-agent's report.
+        codec = AnthropicMessages()
+        task = {"role": "user", "content": "use a sub-agent"}
+        call = {"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "Agent", "input": {
+            "prompt": 'Open a branch per file: echo "[branch] Read models :: read models.py", then echo "[return] ...".'}}]}
+        report = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "The agent's report."}]}
+        sent = self.engine.prepare(codec, HARNESS, {"model": "m", "messages": [task, call, report], "tools": [{"name": "Bash"}]},
+                                   tenant="a", post=lambda r: (500, {})).body["messages"]
+        self.assertEqual(sent[-1], report)
+
+    def test_an_echo_reported_without_its_output_still_signals(self) -> None:
+        # A harness that reports no output for the echo: the call says it.
+        sent = self.send(*self.history, *run(10, 'echo "[branch] Read files :: read file_2"', "")).body["input"]
+        self.assertTrue(self.text(sent[-1]).startswith("ROLE CHANGE"))
+
+    def test_gemini_a_branch_beside_other_calls_is_ignored(self) -> None:
+        codec = Gemini()
+
+        def call(command: str) -> dict[str, Any]:
+            return {"functionCall": {"name": "run_shell_command", "args": {"command": command}}}
+
+        def output(text: str) -> dict[str, Any]:
+            return {"functionResponse": {"name": "run_shell_command", "response": {"output": text}}}
+
+        task = {"role": "user", "parts": [{"text": "read the files"}]}
+        calls = {"role": "model", "parts": [call("cat file_1.txt"), call('echo "[branch] Read :: read file_2"')]}
+        results = {"role": "user", "parts": [output("file 1 text"), output("[branch] Read :: read file_2")]}
+        sent = self.engine.prepare(codec, HARNESS, {"contents": [task, calls, results], "tools": [{}]}, tenant="g",
+                                   post=lambda r: (500, {})).body["contents"][-1]["parts"]
+        self.assertEqual(sent, [*results["parts"], {"text": IGNORED.format(name="branch")}])
 
     def test_gemini_folds_once(self) -> None:
         codec = Gemini()

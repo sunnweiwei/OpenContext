@@ -15,6 +15,7 @@ from opencontext.protocols import Gemini, OpenAIChat, OpenAIResponses
 from opencontext.strategies import ACM, MEM1, AutoCompact, Compaction, SelfCompact
 from opencontext.strategies.acm import NOTHING, QUERY_MEMORY_PROMPT, SUMMARY_INSTRUCTION
 from opencontext.strategies.autocompact import PROMPT
+from opencontext.strategies.conversation import IGNORED
 from opencontext.prompts import SUMMARY_PREFIX
 from opencontext.strategies.selfcompact import RUBRIC, SUMMARIZER
 
@@ -241,3 +242,37 @@ class MEM1Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ParallelSignalTests(unittest.TestCase):
+    """A signal echoed beside other calls (Claude Code answers them in one message) is ignored, the
+    results as they were, and the model told so on that request."""
+
+    def send(self, strategy: Any, command: str) -> list[dict[str, Any]]:
+        from opencontext.harnesses import ClaudeCode
+        from opencontext.protocols import AnthropicMessages
+
+        def use(i: str, command: str) -> dict[str, Any]:
+            return {"type": "tool_use", "id": i, "name": "Bash", "input": {"command": command}}
+
+        messages = [{"role": "user", "content": "work"},
+                    {"role": "assistant", "content": [use("x", "cat a.py"), use("s", command)]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": "A TEXT"},
+                                                 {"type": "tool_result", "tool_use_id": "s", "content": command[6:-1]}]}]
+        self.messages = messages
+        return Engine(strategy).prepare(AnthropicMessages(), ClaudeCode(), {"model": "m", "messages": messages, "tools": [{}]},
+                                        tenant="t", post=lambda r: (200, {"content": [{"type": "text", "text": "SUMMARY"}],
+                                                                          "stop_reason": "end_turn"})).body["messages"]
+
+    def test_autocompact(self) -> None:
+        from opencontext.strategies import AutoCompact
+        sent = self.send(AutoCompact(), 'echo "[compact]"')
+        self.assertEqual(sent[-1]["content"][:2], self.messages[-1]["content"])
+        self.assertEqual(sent[-1]["content"][2]["text"], IGNORED.format(name="compact"))
+
+    def test_acm(self) -> None:
+        from opencontext.strategies import ACM
+        with tempfile.TemporaryDirectory() as directory:
+            sent = self.send(ACM(directory=directory), 'echo "[manage_context]"')
+        self.assertEqual(sent[-1]["content"][:2], self.messages[-1]["content"])
+        self.assertTrue(sent[-1]["content"][2]["text"].startswith(IGNORED.format(name="manage_context")))  # (its token count after)
