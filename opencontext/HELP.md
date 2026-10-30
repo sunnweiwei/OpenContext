@@ -165,6 +165,15 @@ While a harness points at OpenContext, it reaches its model only through OpenCon
 fails because nothing answers at OpenContext's address, run `opencontext start`. If that does not help, read
 the log (`~/.config/opencontext/opencontext.log`), or `opencontext uninstall` the harness.
 
+`opencontext status` says one of three things (and exits with 0, 3 or 1):
+
+- **running**: OpenContext answers, with its strategy.
+- **unreachable**: OpenContext's process runs but does not answer from where the command ran. A sandbox
+  that keeps commands off the network (Codex runs commands in one) does that: run it outside the
+  sandbox. If OpenContext does not answer there either, it is stuck: end the process it names, then run
+  `opencontext start`. `opencontext start`, `opencontext setup` and `opencontext set` never restart an unreachable OpenContext.
+- **not running**: no OpenContext process; `opencontext start` starts it.
+
 Going back to the harness on its own: `opencontext uninstall <harness>` (there is no stopping OpenContext by
 hand: a harness still pointed at it would fail), not changing its endpoint by hand (its own
 auto-compaction would stay off).

@@ -6,6 +6,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import signal
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -115,7 +118,7 @@ class SetupTests(unittest.TestCase):
             code, out = self.run_cli("uninstall", "--all")
         self.assertEqual((code, install.installed(), released), (0, [], [1]))
         self.assertIn("no longer started at login", out)
-        self.assertNotIn("opencontext start", json.dumps(json.loads((claude / "settings.json").read_text())))  # (its hook went)
+        self.assertFalse((claude / "settings.json").exists())  # (its hook went, and the file OpenContext made with it)
         with self.assertRaises(SystemExit):
             self.run_cli("stop")  # (there is no stopping OpenContext: uninstalling is going back)
 
@@ -251,7 +254,7 @@ class SetupTests(unittest.TestCase):
             code, out = self.run_cli("status")
             self.assertIn("harnesses set up: claude_code (hook)", out)
             code, out = self.run_cli("uninstall", "claude")
-            self.assertEqual(config().get("env", {}), {})
+            self.assertFalse((claude / "settings.json").exists())  # (OpenContext made it: nothing of the user's in it)
 
     def test_settings_read_at_start_restart_the_service(self) -> None:
         with mock.patch.object(service, "status", return_value={"strategy": "compaction"}), \
@@ -328,6 +331,47 @@ class StarterTests(unittest.TestCase):
         install.uninstall("kimi_code")
         self.assertEqual(tomllib.loads(config.read_text())["hooks"], [{"event": "Stop", "command": "echo mine"}])
 
+    def test_kimi_codes_tables_named_with_a_slash_are_found_and_kept_toml(self) -> None:
+        # (reported: its model `luna/gpt-6-luna` got a second, unquoted table, and Kimi Code read no config)
+        import tomllib
+
+        from opencontext.harnesses import HARNESSES
+        from opencontext.harnesses.base import NEVER
+
+        config = self.root / "kimi" / "config.toml"
+        config.parent.mkdir()
+        original = ('default_model = "luna/gpt-6-luna"\n\n[providers."luna.example"]\ntype = "openai"\n'
+                    'base_url = "https://luna.example/v1"\n\n[models."luna/gpt-6-luna"]\nprovider = "luna.example"\n'
+                    'max_context_size = 400000\n')
+        config.write_text(original)
+        install.install("kimi_code", "http://opencontext", HARNESSES["kimi_code"].settings())
+        written = tomllib.loads(config.read_text())  # (valid TOML)
+        self.assertEqual(config.read_text().count("[models."), 1)
+        self.assertEqual(written["models"]["luna/gpt-6-luna"]["max_context_size"], NEVER)
+        self.assertTrue(written["providers"]["luna.example"]["base_url"].startswith("http://opencontext/up/"))
+        install.uninstall("kimi_code")
+        self.assertEqual(config.read_text(), original)
+        # A new table's name is quoted.
+        install.install("kimi_code", "http://opencontext", [install.Setting(config, ("models", "sol/gpt-6", "max_context_size"), 1)])
+        self.assertEqual(tomllib.loads(config.read_text())["models"]["sol/gpt-6"], {"max_context_size": 1})
+        self.assertIn('[models."sol/gpt-6"]', config.read_text())
+        install.uninstall("kimi_code")
+
+    def test_kimi_codes_config_an_earlier_opencontext_broke_is_repaired_on_uninstall(self) -> None:
+        # What `opencontext setup` wrote before: the same table again, unquoted, after the user's own.
+        import tomllib
+
+        config = self.root / "kimi" / "config.toml"
+        config.parent.mkdir()
+        original = '[models."luna/gpt-6-luna"]\nprovider = "luna"\nmax_context_size = 400000\n'
+        config.write_text(original + "\n[models.luna/gpt-6-luna]\nmax_context_size = 9007199254740992\n")
+        key = ["models", "luna/gpt-6-luna", "max_context_size"]
+        install.state_file().parent.mkdir(parents=True, exist_ok=True)
+        install.state_file().write_text(json.dumps({"kimi_code": [{"path": str(config), "key": key, "previous": None}]}))
+        install.uninstall("kimi_code")
+        self.assertEqual(config.read_text(), original)
+        self.assertEqual(tomllib.loads(config.read_text())["models"]["luna/gpt-6-luna"]["max_context_size"], 400000)
+
 
 class ServiceTests(unittest.TestCase):
     def test_the_service_runs_opencontext_and_restarts_it(self) -> None:
@@ -336,6 +380,45 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("-m opencontext.cli serve", unit)
         self.assertIn("Restart=always", unit)
         self.assertIn("<key>KeepAlive</key><true/>", agent)
+
+    def process(self, code: str = "import time; time.sleep(60)", *args: str) -> subprocess.Popen:
+        child = subprocess.Popen([sys.executable, "-c", code, *args])
+        self.addCleanup(lambda: (child.kill(), child.wait()))
+        time.sleep(0.3)
+        return child
+
+    def test_a_opencontext_whose_process_runs_but_does_not_answer_is_unreachable(self) -> None:
+        # (from a sandbox that keeps commands off the network, as Codex runs them, or stuck)
+        opencontext = self.process("import time; time.sleep(60)", "-m", "opencontext.cli", "serve")
+        with opencontext_settings(port=service.free_port()), mock.patch.object(service, "wait", return_value=None):
+            service._remember({"manager": "process", "pid": opencontext.pid})
+            self.assertEqual(service.process(), opencontext.pid)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(cli._status(), cli.UNREACHABLE)
+            self.assertIn(f"OpenContext: unreachable. OpenContext's process {opencontext.pid} runs, but does not answer", out.getvalue())
+            with self.assertRaisesRegex(RuntimeError, "end process"):  # not started again over it
+                service.ensure()
+            self.assertIsNone(opencontext.poll())
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertEqual(cli._change({"strategy": "folding"}, ()), 1)
+            self.assertIn("saved; OpenContext's process", err.getvalue())
+            # Its pid taken by another process since: not running.
+            other = self.process()
+            service._remember({"manager": "process", "pid": other.pid})
+            self.assertIsNone(service.process())
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(cli._status(), 1)
+
+    def test_a_opencontext_that_does_not_stop_when_asked_is_made_to(self) -> None:
+        # (one waiting on requests that stay open holds the HTTPS proxy's port)
+        opencontext = self.process("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+                             "-m", "opencontext.cli", "serve")
+        with opencontext_settings(), mock.patch.object(service, "STOPPING", 0.5):
+            service._remember({"manager": "process", "pid": opencontext.pid})
+            service.stop_process()
+        self.assertEqual(opencontext.wait(timeout=5), -signal.SIGKILL)
 
 
 if __name__ == "__main__":
