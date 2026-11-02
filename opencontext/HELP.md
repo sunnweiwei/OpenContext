@@ -66,13 +66,14 @@ it with the rest.
 | Claude Code, WorkBuddy / CodeBuddy, Gemini CLI | a `SessionStart` hook in its settings |
 | Kimi Code | a `UserPromptSubmit` hook (each prompt) |
 | pi | an extension (each agent run) |
-| OpenCode, Kilo | a plugin (each model request) |
+| OpenCode 1, Kilo | a plugin (each model request) |
 | Hermes Agent | a plugin, enabled in `plugins.enabled` (each model request) |
-| Codex, DeepSeek Harness, OpenClaw, Crush, Goose, nanobot, mini-swe-agent | nothing: after a restart, run `opencontext start` |
+| Codex, DeepSeek Harness, OpenClaw, Crush, Goose, nanobot, mini-swe-agent, OpenCode 2 | nothing: after a restart, run `opencontext start` |
 
 Codex runs a hook only once its user has trusted it in Codex, and OpenContext does not trust hooks on
 anyone's behalf. DeepSeek Harness runs its hooks in its sandbox, where nothing can start OpenContext.
-Hermes's shell hooks need consent too, so its hook is a plugin.
+Hermes's shell hooks need consent too, so its hook is a plugin. OpenCode 2 (`@opencode/cli`) takes
+OpenCode 1's settings but not its plugins.
 
 `opencontext setup <harness> --autostart` registers OpenContext with the system's service manager instead:
 a systemd user unit on Linux, a launchd agent on macOS. That starts OpenContext at login and again if
