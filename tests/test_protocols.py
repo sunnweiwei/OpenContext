@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import struct
 import unittest
 from pathlib import Path
 
@@ -90,8 +92,11 @@ class OpenAIResponsesTests(unittest.TestCase):
 
     def test_classify_marks_media_and_tool_items(self) -> None:
         image = {"type": "message", "role": "user",
-                 "content": [{"type": "input_text", "text": "look"}, {"type": "input_image", "image_url": "u"}]}
-        self.assertTrue(self.codec.classify(image).media)
+                 "content": [{"type": "input_text", "text": "look"},
+                             {"type": "input_image", "image_url": "u", "detail": "high"}]}
+        classified = self.codec.classify(image)
+        self.assertTrue(classified.media)
+        self.assertEqual(classified.media[0].detail, "high")
         self.assertEqual(self.codec.classify({"type": "local_shell_call", "call_id": "c"}).kind, Kind.TOOL_CALL)
         self.assertEqual(self.codec.classify({"type": "shell_call_output", "call_id": "c"}).kind, Kind.TOOL_RESULT)
         self.assertEqual(self.codec.classify({"type": "compaction", "encrypted_content": "x"}).kind, Kind.SUMMARY)
@@ -329,6 +334,14 @@ class OpaqueContentTests(unittest.TestCase):
         self.assertEqual(item_tokens(Item(Kind.REASONING, "abcd", opaque=300)), 76)
         self.assertEqual(item_tokens(Item(Kind.USER, "x" * 250), bytes_per_token("claude-x")), 100)
 
+    def test_an_image_counts_by_its_pixels_not_its_base64(self) -> None:
+        png = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + struct.pack(">II", 1920, 1080)
+                               + b"\x08\x02\x00\x00\x00" + b"\x00" * 4000).decode()
+        image = OpenAIChat().classify({"role": "tool", "tool_call_id": "c", "content": [
+            {"type": "text", "text": "done"}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{png}"}}]})
+        self.assertEqual(item_tokens(image), 1 + 2765)
+        self.assertEqual(item_tokens(Item(Kind.USER, media=(Media("image", url="https://x/y.png"),))), 1600)
+
 
 class CompletionTests(unittest.TestCase):
     """A summary counts only if its response ended normally (Codex waits for response.completed)."""
@@ -395,7 +408,7 @@ class StrategyAdditionsTests(unittest.TestCase):
             call, result = self.CALLS[codec.name]
             edited = codec.edit(result, "short", ())
             self.assertEqual(codec.orphans([codec.user_message("go"), call, edited]), set(), codec.name)
-            self.assertIn("short", codec.classify(edited).text)
+            self.assertEqual(codec.classify(edited).text, "short", codec.name)  # (as it reads back: what was written)
             self.assertNotIn("a long output", json.dumps(edited))
             with self.assertRaises(ValueError):
                 codec.edit(call, "another call", ())
@@ -422,6 +435,12 @@ class StrategyAdditionsTests(unittest.TestCase):
         kept = AnthropicMessages().edit(result, "screen", ())
         self.assertEqual(AnthropicMessages().classify(kept).media, ())
         self.assertEqual(kept["content"][0]["tool_use_id"], "t1")
+
+    def test_a_gemini_result_reads_as_its_output_and_a_response_of_more_as_its_json(self) -> None:
+        _, result = self.CALLS["gemini"]
+        self.assertEqual(Gemini().classify(result).text, "a long output")
+        more = {"role": "user", "parts": [{"functionResponse": {"name": "sh", "response": {"error": "denied"}}}]}
+        self.assertEqual(json.loads(Gemini().classify(more).text), more["parts"][0]["functionResponse"])
 
     def test_a_repeated_gemini_result_reads_once(self) -> None:
         _, result = self.CALLS["gemini"]

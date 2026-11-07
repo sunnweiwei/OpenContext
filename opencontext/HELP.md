@@ -135,6 +135,8 @@ To change the strategy later, run `opencontext strategy <name>`. It needs no res
 | `acm` | ACM: the model compresses its context when it decides to, and recalls what it compressed | `acm_dir` (/tmp/.acm) |
 | `ace` | ACE: a playbook of lessons from the tasks the agent ended, kept across conversations, with compaction for the window | `ace_playbook` (`ace_playbook.md` in OpenContext's directory), the `compaction` settings |
 | `mem1` | MEM1: the model carries its memory in a state it rewrites every turn | |
+| `jev` | fast-jev-compaction: past 60% of the window, TypeSafe's Jev decides which tool calls and results stay; the rest stays verbatim (compaction where it cannot) | `jev_api_key` (else `TYPESAFE_API_KEY`), `jev_url`, `jev_model` (OpenRouter's: `https://openrouter.ai/api/alpha/decisions`, `~typesafe/jev-latest`), `compact_ratio` (0.6), the `compaction` settings |
+| `headroom` | Headroom compresses each tool result in place as it comes in (logs to their errors, JSON arrays to tables, a repeated output to a pointer; file reads stay), what was forwarded kept as it was; compaction keeps it within the window | a running `headroom proxy --port 8790`; `headroom_url`, `headroom_mode` (`ccr` with Headroom's MCP tool), `headroom_model`, `headroom_token`, the `compaction` settings |
 | `rlm`, `rlm_persistent` | RLM: the conversation becomes a variable in a Python REPL the model works over (runs model-written code) | `rlm_environment` (local), `rlm_max_depth` (1), `rlm_max_iterations` (30) |
 
 The thresholds count the model's context window. OpenContext knows the windows of common models;
@@ -150,7 +152,8 @@ Values are JSON where they parse as JSON (`26000`, `true`), text otherwise. Most
 from the next request. Some only apply when OpenContext starts, and `opencontext set` restarts OpenContext
 for them:
 
-- where OpenContext listens: `host` (127.0.0.1), `port` (8787);
+- where OpenContext listens: `host` (127.0.0.1), `port` (8787); another host than this machine's only with
+  `allow_network=true` (anyone who reaches it could use OpenContext, and the API keys in its settings);
 - its upstreams: `openai_base_url`, `chatgpt_base_url`, `anthropic_base_url`, `gemini_base_url`,
   and `openai_api_key`, `anthropic_api_key` for requests that carry no key;
 - its store: `cache_path` (off keeps it in memory), `cache_ttl_seconds`, `cache_max_entries`,
@@ -159,7 +162,9 @@ for them:
 ## Checking and undoing
 
     opencontext status                   # running?, its strategy, what keeps it running, the harnesses set up
+    opencontext doctor                   # whether each harness really goes through OpenContext, and OpenContext to its provider
     opencontext start                    # make sure OpenContext runs (what the harnesses' hooks run)
+    opencontext restart                  # restart it, after updating OpenContext
     opencontext uninstall codex          # put the harness's config back as it was (--all: every harness)
 
 While a harness points at OpenContext, it reaches its model only through OpenContext. If a model request
@@ -174,6 +179,19 @@ the log (`~/.config/opencontext/opencontext.log`), or `opencontext uninstall` th
   sandbox. If OpenContext does not answer there either, it is stuck: end the process it names, then run
   `opencontext start`. `opencontext start`, `opencontext setup` and `opencontext set` never restart an unreachable OpenContext.
 - **not running**: no OpenContext process; `opencontext start` starts it.
+
+A harness that stops going through OpenContext does so silently: its conversations go on, unmanaged.
+`opencontext doctor` finds why (and exits with 0, 1 for warnings, 2 for problems):
+
+- **its config was rewritten** by another tool (cc-switch rewrites Claude Code's settings.json whole
+  when you switch provider): `opencontext setup <harness>` points it at OpenContext again, and what is there now
+  (the provider you switched to) is what `opencontext uninstall` restores;
+- **the shell sets what its config sets**: Gemini CLI, Goose and mini-swe-agent take a variable of
+  the shell (`GOOGLE_GEMINI_BASE_URL`, `OPENAI_HOST`, ...) before their config's;
+- **OpenContext runs older code** than is installed (updated since it started): `opencontext restart`;
+- **OpenContext cannot reach the provider**, or does not trust its certificate. OpenContext trusts what the
+  harness trusts: the system's certificate store (where IT puts the root of a TLS-inspecting proxy),
+  the public roots, and `NODE_EXTRA_CA_CERTS`; or `SSL_CERT_FILE` instead, where it is set for OpenContext.
 
 Going back to the harness on its own: `opencontext uninstall <harness>` (there is no stopping OpenContext by
 hand: a harness still pointed at it would fail), not changing its endpoint by hand (its own

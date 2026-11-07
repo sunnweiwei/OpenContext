@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..core.ir import AGENT_KINDS, Context, Item, Kind, Request
-from ..core.tokens import approx_tokens, truncate_middle
+from ..core.tokens import approx_tokens, item_tokens, truncate_middle
 from ..prompts import SUMMARIZATION_PROMPT, SUMMARY_PREFIX
 from .base import Summarizer
 from .. import settings
@@ -73,13 +73,18 @@ class Compaction:
     def limit(self, window: int | None) -> int:
         return self.threshold or int(self.ratio * (window or DEFAULT_WINDOW))
 
-    def plan(self, request: Request, summarizer: Summarizer) -> Context | None:
+    def due(self, request: Request) -> tuple[bool, int]:
+        """Whether the request reaches the threshold (or the window's hard limit), and the budget."""
+
         if self.growth:
             budget, over = self.growth, request.base is not None and request.tokens - request.base >= self.growth
         else:
             budget = self.limit(request.window)
             over = request.tokens >= budget
-        over = over or (request.window is not None and request.tokens >= HARD_LIMIT * request.window)
+        return over or (request.window is not None and request.tokens >= HARD_LIMIT * request.window), budget
+
+    def plan(self, request: Request, summarizer: Summarizer) -> Context | None:
+        over, budget = self.due(request)
         if not request.force and not over:
             return None
         cut = summary_cut(request)
@@ -87,7 +92,7 @@ class Compaction:
             return None
         items = request.current[:cut]
         users = self._recent_users(items)
-        freed = sum(approx_tokens(i.text) for i in items) - sum(approx_tokens(i.text) for i in users)
+        freed = sum(map(item_tokens, items)) - sum(map(item_tokens, users))
         if not request.force and freed < self.min_gain * budget:
             return None
         summary = Item(Kind.SUMMARY, f"{SUMMARY_PREFIX}\n{summarizer.summarize(cut, SUMMARIZATION_PROMPT)}")

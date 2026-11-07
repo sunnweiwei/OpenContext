@@ -13,18 +13,28 @@ from typing import Any
 
 import httpx
 
-from opencontext import Compaction, Engine, PrefixStore, ProxyConfig, create_app
+from opencontext import Compaction, Engine, PrefixStore, ProxyConfig, create_app, providers
 from opencontext.prompts import SUMMARY_PREFIX
 from opencontext.transport import engine_from_settings
-from tests.fakes import COMPACTION_MARKER, FakeUpstream, local_upstreams, opencontext_settings, serve
+from opencontext.core.budget import InputBudget
+from opencontext.core.ir import Context, Item, Kind, Request
+from opencontext.strategies import ContextLanguageModel
+from opencontext.strategies.base import Strategy, Summarizer
+from tests.fakes import COMPACTION_MARKER, FakeUpstream, _prompt_tokens, local_upstreams, opencontext_settings, serve
 
 NEVER = Compaction(threshold=10**9)
+# A local input budget no test request reaches: it selects the bounded-evaluation recovery path.
+try:
+    GENEROUS: InputBudget | None = InputBudget(1_000_000)
+except Exception:  # (tiktoken, the `budget` extra, or its encoding is unavailable)
+    GENEROUS = None
 
 
 @contextmanager
-def opencontext(fake: FakeUpstream, strategy: Compaction = NEVER, api_key: str | None = None) -> Iterator[tuple[str, Engine]]:
+def opencontext(fake: FakeUpstream, strategy: Strategy = NEVER, api_key: str | None = None,
+          input_budget: InputBudget | None = None) -> Iterator[tuple[str, Engine]]:
     with serve(fake.app) as upstream:
-        engine = Engine(strategy, PrefixStore())
+        engine = Engine(strategy, PrefixStore(), input_budget=input_budget)
         config = ProxyConfig(upstreams=local_upstreams(upstream, api_key))
         with serve(create_app(engine, config)) as url:
             yield url, engine
@@ -106,6 +116,83 @@ class ProxyTests(unittest.TestCase):
         summaries = [r for r in requests if COMPACTION_MARKER in last_user_text(r["input"])]
         self.assertGreater(len(summaries), 1)  # the summary request itself was trimmed to fit
         self.assertTrue(last_user_text(requests[-1]["input"]).startswith(SUMMARY_PREFIX))
+
+    def test_bounded_clm_guard_does_not_block_explicit_overflow_recovery(self) -> None:
+        if GENEROUS is None:
+            self.skipTest("the bounded path needs the budget extra")
+        fake = FakeUpstream(max_prompt_tokens=2_000)
+        with tempfile.TemporaryDirectory() as directory:
+            strategy = ContextLanguageModel(budget=4_000, reserve=2_000, directory=directory)
+            with opencontext(fake, strategy, input_budget=GENEROUS) as (url, _):
+                response = httpx.post(f"{url}/v1/responses", json=responses_body(10), headers=HEADERS)
+        self.assertEqual(response.status_code, 200)
+        requests = fake.bodies("/v1/responses")
+        main = [r for r in requests if COMPACTION_MARKER not in last_user_text(r["input"])]
+        self.assertEqual(len(main), 2)  # first guarded request, then one recovered request
+        self.assertIn("[context manager: overflow guard]", json.dumps(main[0]))
+        self.assertIn(SUMMARY_PREFIX, json.dumps(main[1]))
+        self.assertGreater(len(requests), len(main))
+
+    def test_bounded_overflow_recovery_rejects_noops_and_never_retries_twice(self) -> None:
+        if GENEROUS is None:
+            self.skipTest("the bounded path needs the budget extra")
+        for noop in (True, False):
+            with self.subTest(noop=noop):
+                forces: list[bool] = []
+
+                class Rewriter:
+                    name = "test-rewriter"
+
+                    def fingerprint(self) -> dict[str, Any]:
+                        return {"name": self.name}
+
+                    def plan(self, request: Request, summarizer: Summarizer) -> Context | None:
+                        forces.append(request.force)
+                        if request.force and noop:
+                            return None
+                        return Context((*request.current, Item(Kind.ASSISTANT, "x" * 8_000)))
+
+                fake = FakeUpstream(max_prompt_tokens=1_000)
+                with opencontext(fake, Rewriter(), input_budget=GENEROUS) as (url, _):
+                    response = httpx.post(f"{url}/v1/responses", json=responses_body(0), headers=HEADERS)
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(forces, [False, True])
+                self.assertEqual(len(fake.bodies("/v1/responses")), 1 if noop else 2)
+
+    def test_the_limit_an_upstream_names_as_it_refuses_is_the_window_from_then_on(self) -> None:
+        """(An account's limit below the model's window: one refusal, then compacted before it.)"""
+
+        self.addCleanup(providers.REFUSED.clear)
+        fake, headers = FakeUpstream(max_prompt_tokens=2_000), {"x-api-key": "tenant"}
+        with opencontext(fake, Compaction()) as (url, _):  # (at 90% of the window: claude-x's 200k, until refused)
+            for task in ("task", "another task"):  # (two conversations of the model)
+                body = messages_body(6)
+                body["messages"][0]["content"] = task
+                response = httpx.post(f"{url}/v1/messages", json={**body, "stream": False}, headers=headers)
+                self.assertEqual(response.status_code, 200)
+        refused = [b for b in fake.bodies("/v1/messages") if _prompt_tokens(b) > 2_000]
+        self.assertEqual([b["messages"][0]["content"] for b in refused], ["task"])
+
+    def test_a_summary_request_whose_connection_drops_is_retried(self) -> None:
+        fake = FakeUpstream()
+        with serve(fake.app) as upstream:
+            app = create_app(Engine(Compaction(threshold=1_000), PrefixStore()),
+                             ProxyConfig(upstreams=local_upstreams(upstream)))
+            with serve(app) as url:
+                client, calls = app.state.summary_client, []
+                original = client.post
+
+                def flaky(*args: Any, **kwargs: Any) -> httpx.Response:
+                    calls.append(1)
+                    if len(calls) == 1:
+                        raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+                    return original(*args, **kwargs)
+
+                client.post = flaky
+                response = httpx.post(f"{url}/v1/responses", json=responses_body(3), headers=HEADERS, timeout=30)
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertTrue(last_user_text(fake.bodies("/v1/responses")[-1]["input"]).startswith(SUMMARY_PREFIX))
 
     def test_failed_compaction_forwards_the_original_request(self) -> None:
         body = responses_body(3)

@@ -6,6 +6,10 @@
     python tests/docker/check.py --strategy clm codex:gpt     the model edits its own context (CLM)
     python tests/docker/check.py --strategy acm codex:gpt     one of the CLM paper's baselines (selfcompact,
                                                               autocompact, acm, mem1, rlm, rlm_persistent)
+    python tests/docker/check.py --strategy jev codex:gpt-api   fast-jev-compaction with the real Jev: its key in
+                                                              JEV_API_KEY (an OpenRouter key: Jev on OpenRouter)
+    python tests/docker/check.py --strategy headroom codex:gpt-api   Headroom (started beside OpenContext) compresses
+                                                              the logs a command prints
 
 Each run gets a throwaway HOME: the harness's own config is written there (the "user's
 existing setup"), `opencontext install <harness>` edits it, OpenContext runs in the background, and
@@ -52,6 +56,7 @@ from opencontext.core.ir import AGENT_KINDS, CONTEXT_KINDS, Item, Kind  # noqa: 
 from opencontext.harnesses import detect  # noqa: E402
 from opencontext.prompts import SUMMARIZATION_PROMPT, SUMMARY_PREFIX  # noqa: E402
 from opencontext.protocols import codec_for  # noqa: E402
+from opencontext.strategies.jev import MODEL as JEV_MODEL, URL as JEV_URL  # noqa: E402
 from opencontext.strategies.selfcompact import RUBRIC, SUMMARIZER  # noqa: E402
 
 IMAGE = "opencontext-harness-test"
@@ -72,6 +77,27 @@ FINISH = ("Do not read file_1.txt to file_4.txt again. Then reply with the codes
           "to file_8.txt) in order, comma-separated, and on a last line the project codename as your project "
           "instructions state it now.")
 PROMPT2 = f"Background notes, not needed for the task:\n{NOTES}\n\nNow read file_5.txt to file_8.txt, {RULES} {DELEGATE}{FINISH}"
+# `--strategy headroom`: service logs a command prints (Headroom keeps a file read as it is), each
+# with one ERROR line in 400 giving a CODE.
+LOG_RULES = ("one command per tool call: run one, wait until you have seen its output, then run the next; "
+             "never run two at once, and take each output in full (no grep, head or tail).")
+HEADROOM_PROMPTS = (f"Run ./serve_log 1 to ./serve_log 4 in the current directory, {LOG_RULES} Each prints a service's "
+                    "log, with one ERROR line giving a CODE. Then reply with the 4 codes in order, comma-separated, "
+                    "and nothing else.",
+                    f"Background notes, not needed for the task:\n{NOTES}\n\nNow run ./serve_log 5 to ./serve_log 8 the "
+                    f"same way, {LOG_RULES} Do not run ./serve_log 1 to 4 again. Then reply with the codes of all 8 "
+                    "logs in order, comma-separated, and on a last line the project codename as your project "
+                    "instructions state it now.")
+HEADROOM_ONE = (f"Run ./serve_log 1 to ./serve_log 8 in the current directory, {LOG_RULES} Each prints a service's log, "
+                "with one ERROR line giving a CODE. Then reply with the 8 codes in order, comma-separated, and nothing else.")
+SERVE_LOG = f"""#!/usr/bin/env python3
+import sys
+n = int(sys.argv[1])
+for i in range(400):
+    print(f"2026-11-04 10:{{i // 60:02d}}:{{i % 60:02d}} INFO worker {{n}} request {{i}} served in 12ms")
+    if i == 200:
+        print(f"2026-11-04 10:03:20 ERROR worker {{n}} failed: CODE {{{CODES!r}[n - 1]}}")
+"""
 # `--clm-edit`: the model edits its context as told (CLM's mechanism, whatever it would choose itself),
 # then answers from what it sees.
 EDIT = ("Read file_1.txt, file_2.txt and file_3.txt in the current directory, one file per tool call, each in full. "
@@ -226,6 +252,12 @@ def listening(port: int, log: str) -> str:
     up = f"(: </dev/tcp/127.0.0.1/{port}) 2>/dev/null"
     return f"for _ in $(seq 600); do {up} && break; sleep 0.2; done; {up} || {{ tail -20 {log}; exit 1; }}"
 
+
+# Headroom's proxy beside OpenContext, for its POST /v1/compress (its telemetry off), once its text compressor
+# is in (until then Headroom leaves text as it is: a run would depend on how soon its first request came)
+HEADROOM = ("HEADROOM_TELEMETRY=off HEADROOM_BEACON=off DO_NOT_TRACK=1 headroom proxy --port 8790 > ~/headroom.log 2>&1 &\n"
+            + listening(8790, "~/headroom.log") + "\nfor _ in $(seq 900); do grep -qE 'Kompress: warmed|Kompress "
+            "background warm-up failed|Kompress: (DISABLED|not installed|ENABLED)' ~/headroom.log && break; sleep 0.2; done")
 
 RECORDER = f"""UPSTREAM=$(python3 -c 'import json, pathlib; p = pathlib.Path("~/.claude/settings.json").expanduser()
 print((json.loads(p.read_text()) if p.exists() else {{}}).get("env", {{}}).get("ANTHROPIC_BASE_URL", "https://api.anthropic.com"))')
@@ -488,6 +520,9 @@ def run(name: str, growth: int | None = None, retried: bool = False, probe: bool
         if strategy in ("prolong", "acm"):
             text.insert(lines // 2, f"file {n} animal: {ANIMALS[n - 1]}")
         (project / f"file_{n}.txt").write_text("\n".join([*text, f"CODE: {code}"]) + "\n")
+    if strategy == "headroom":
+        (project / "serve_log").write_text(SERVE_LOG)
+        (project / "serve_log").chmod(0o755)
     for file in STATE_FILES:  # the harness's own instructions, changed between the turns
         (project / file).write_text("# Project instructions\n\nThe project codename is ALPHA.\n")
 
@@ -509,6 +544,8 @@ def run(name: str, growth: int | None = None, retried: bool = False, probe: bool
         first, second = ACM_PROMPTS if spec.resume else (ACM_ONE, "")
     if strategy.startswith("rlm"):
         first, second = RLM_PROMPTS if spec.resume else (RLM_TASK, "")
+    if strategy == "headroom":
+        first, second = HEADROOM_PROMPTS if spec.resume else (HEADROOM_ONE, "")
     # Growth (every GROWTH new tokens) by default; `window` instead uses OpenContext's own trigger,
     # 90% of a context window of that many tokens (and 95% always).
     trigger = {"context_window": str(window)} if window else {
@@ -519,6 +556,16 @@ def run(name: str, growth: int | None = None, retried: bool = False, probe: bool
         trigger = {"strategy": "folding"}
     if strategy == "prolong":  # compaction inside, as usual, and the log where the harness's tools reach it
         trigger |= {"strategy": "prolong", "prolong_log": "/project/.prolong/log.jsonl"}
+    if strategy == "jev":  # Jev at TypeSafe, or OpenRouter for an OpenRouter key
+        # 60% of the window, past turn 1's reads and one of turn 2's (Codex: ~29k tokens): calls older
+        # than the newest six messages for Jev to judge. (Every few thousand tokens, it would have none.)
+        openrouter = os.environ["JEV_API_KEY"].startswith("sk-or-")
+        trigger = {"context_window": str(window or JEV_WINDOW), "strategy": "jev",
+                   "jev_url": os.getenv("JEV_URL", "https://openrouter.ai/api/alpha/decisions" if openrouter else JEV_URL),
+                   "jev_model": os.getenv("JEV_MODEL", "~typesafe/jev-latest" if openrouter else JEV_MODEL),
+                   "TYPESAFE_API_KEY": os.environ["JEV_API_KEY"]}
+    if strategy == "headroom":  # each result as it comes in, by the Headroom started beside OpenContext
+        trigger = {"strategy": "headroom"}
     if strategy == "ace":  # compaction for the window, as usual; the playbook in HOME
         trigger |= {"strategy": "ace", "ace_playbook": "/home/agent/ace_playbook.md"}
     if strategy in ("selfcompact", "autocompact", "acm", "mem1", "rlm", "rlm_persistent"):  # (AutoCompact's fallback: 90% of the window)
@@ -550,7 +597,7 @@ def run(name: str, growth: int | None = None, retried: bool = False, probe: bool
         {stop}
         {"cat ~/.config/opencontext/opencontext.log >> ~/opencontext.log 2>/dev/null" if cold else ""}
     """, timeout=2 * turn + 300, setup="\n".join([EARLY[harness] if selfcompact else "", RECORDER if via == "hook" else "",
-                                                 setup if cold else ""]),
+                                                 HEADROOM if strategy == "headroom" else "", setup if cold else ""]),
               via=via, install=not cold, serve=not cold)
     if probe:
         return {"name": name, "home": str(home)}
@@ -567,6 +614,10 @@ def run(name: str, growth: int | None = None, retried: bool = False, probe: bool
         return evaluate_prolong(name, home)
     if strategy == "ace":
         return evaluate_ace(name, home)
+    if strategy == "jev":
+        return evaluate_jev(name, home)
+    if strategy == "headroom":
+        return evaluate_headroom(name, home)
     if strategy in BASELINES:
         return BASELINES[strategy](name, home)
     # OpenContext's own trigger compacts less often; after the harness compacted itself, turn 2 starts small.
@@ -696,9 +747,9 @@ def container(name: str, root: Path, env: dict[str, str], turns: str, timeout: i
               "-e", "HOME=/home/agent", *(["-e", "PYTHONPATH=/opencontext"] if importable else [])]
     for mount in mounts:
         docker += ["-v", mount]
-    for var, value in env.items():
-        docker += ["-e", f"{var}={value}"]
-    subprocess.run([*docker, IMAGE, "bash", "-c", script], check=False, timeout=timeout)
+    for var in env:  # (the values from this process's environment: API keys stay out of the command line)
+        docker += ["-e", var]
+    subprocess.run([*docker, IMAGE, "bash", "-c", script], check=False, timeout=timeout, env={**os.environ, **env})
 
 
 
@@ -771,6 +822,7 @@ def name_of(keys: list[bytes]) -> tuple[bytes, ...]:
 
 
 LAYOUT = {Kind.SYSTEM: "S", Kind.CONTEXT: "C", Kind.USER: "U", Kind.SUMMARY: "Y"}
+JEV_WINDOW = 48_000
 MARK = json.dumps(SUMMARY_PREFIX)[1:61]  # how every summary starts inside a JSON body
 
 
@@ -947,6 +999,91 @@ def evaluate(name: str, home: Path, need: tuple[int, int] | None = None, selfcom
         "errors": (text("harness.err")[-300:] + text("harness2.err")[-300:]) if problems else "",
         "home": str(home),
     }
+
+
+def evaluate_jev(name: str, home: Path) -> dict:
+    """`jev` (fast-jev-compaction): Jev was asked about the older calls and some went, cut or dropped
+    (a run freeing too little is compacted instead, and told); the requests after carried the cut
+    results; both answers are right; every model call was accepted. A file read again is told, not a
+    failure: re-running the tool is what the library leaves the model for what it dropped."""
+
+    def text(file: str) -> str:
+        path = home / file
+        return path.read_text(errors="replace") if path.exists() else ""
+
+    trace = [json.loads(line) for line in text("trace.jsonl").splitlines() if line.strip()]
+    requests = [r for r in trace if "body" in r and r["path"].endswith(MODEL_CALLS)]
+    log, answers = text("opencontext.log"), [text("harness.out").strip(), text("harness2.out").strip()]
+    runs = re.findall(r"jev: (\d+)% reduction; ([^\n]*)", log)
+    applied = [(int(share), how) for share, how in runs if int(share) >= 25]
+    cut = sum("[fast-jev-compaction truncated" in json.dumps(r.get("forwarded") or {}) for r in requests)
+    dropped = sum(r.get("forwarded") is not None and r["sent"] < r["items"] and MARK not in json.dumps(r["forwarded"])
+                  for r in requests)
+    problems = [] if runs else ["Jev was never asked"]
+    if runs and not applied:
+        problems.append(f"Jev was asked {len(runs)}x, and each freed too little (compaction instead)")
+    if failed := re.findall(r"jev: fallback to compaction \((?!below)([^\n]*)\)", log):
+        problems.append(f"Jev failed {len(failed)}x: {failed[-1][:120]}")
+    for turn, (answer, codes) in enumerate(zip(answers, (CODES[:4], CODES) if SPECS[name].resume else (CODES,)), start=1):
+        if not re.search(SEPARATOR.join(codes), answer.lower()):
+            problems.append(f"turn {turn} answer is wrong: {answer[-120:]!r}")
+    rejected = sum(r["status"] >= 400 for r in trace if "status" in r)
+    if rejected:
+        problems.append(f"{rejected} model calls rejected")
+    read: dict[int, int] = {}
+    for request in requests:
+        codec, harness = codec_for(request["path"]), detect({}, path=request["path"])
+        for n in files_read(codec, harness, codec.items(request["body"])):
+            read[n] = read.get(n, 0) + 1
+    return {"name": name, "passed": not problems, "requests": len(requests), "jev": runs, "fallbacks": len(runs) - len(applied),
+            "requests_with_cut_results": cut, "requests_with_calls_dropped": dropped,
+            "read_again": sorted(n for n, k in read.items() if k > 1), "problems": problems,
+            "answers": [answer[-80:] for answer in answers], "home": str(home)}
+
+
+def evaluate_headroom(name: str, home: Path) -> dict:
+    """`headroom`: Headroom was asked about each new result and compressed some (the logs: their
+    ERROR lines kept); what OpenContext forwarded once it forwarded again as it was (the prompt cache
+    holds); both answers are right; every model call was accepted."""
+
+    def text(file: str) -> str:
+        path = home / file
+        return path.read_text(errors="replace") if path.exists() else ""
+
+    trace = [json.loads(line) for line in text("trace.jsonl").splitlines() if line.strip()]
+    requests = [r for r in trace if "body" in r and r["path"].endswith(MODEL_CALLS)]
+    log, answers = text("opencontext.log"), [text("harness.out").strip(), text("harness2.out").strip()]
+    asked = re.findall(r"headroom: (\S+) of (\S+) tokens saved; ([^\n]*)", log)
+    failed = re.findall(r"headroom: ([^\n]*); the results go as they are", log)
+    views = []  # each request's items as the harness sent them and as OpenContext forwarded them
+    for request in requests:
+        codec = codec_for(request["path"])
+        raw = [codec.canonical(item) for item in codec.items(request["body"])]
+        views.append((raw, [codec.canonical(item) for item in codec.items(request.get("forwarded") or request["body"])]))
+    compressed = len({f for raw, forwarded in views for r, f in zip(raw, forwarded) if r != f})  # (outputs, once each)
+    rewritten = 0  # requests changing what an earlier one forwarded of the same history
+    for i, (raw, forwarded) in enumerate(views):
+        shared = [(next((k for k, (a, b) in enumerate(zip(raw, other)) if a != b), min(len(raw), len(other))), sent)
+                  for other, sent in views[:i]]
+        if shared and (common := max(shared, key=lambda pair: pair[0]))[0] and forwarded[:common[0]] != common[1][:common[0]]:
+            rewritten += 1
+    problems = [] if asked else ["Headroom was never asked"]
+    if asked and not compressed:
+        problems.append("Headroom compressed no result")
+    if failed:
+        problems.append(f"Headroom failed {len(failed)}x: {failed[-1][:120]}")
+    if rewritten:
+        problems.append(f"{rewritten} requests changed what OpenContext had forwarded (the prompt cache missed)")
+    for turn, (answer, codes) in enumerate(zip(answers, (CODES[:4], CODES) if SPECS[name].resume else (CODES,)), start=1):
+        if not re.search(SEPARATOR.join(codes), answer.lower()):
+            problems.append(f"turn {turn} answer is wrong: {answer[-120:]!r}")
+    rejected = sum(r["status"] >= 400 for r in trace if "status" in r)
+    if rejected:
+        problems.append(f"{rejected} model calls rejected")
+    return {"name": name, "passed": not problems, "requests": len(requests), "headroom": len(asked),
+            "saved": [f"{saved}/{before}" for saved, before, _ in asked], "results_compressed": compressed,
+            "transforms": sorted({t for *_, how in asked for t in how.split(", ")}), "problems": problems,
+            "answers": [answer[-80:] for answer in answers], "home": str(home)}
 
 
 def evaluate_hook(name: str, home: Path) -> dict:
@@ -1628,7 +1765,7 @@ def main() -> int:
     parser.add_argument("--native-compact", action="store_true", help="the harness compacts itself between the turns")
     parser.add_argument("--file-lines", type=int, default=120, help="lines per file (each ~18 tokens)")
     parser.add_argument("--strategy", default="compaction",
-                        choices=["compaction", "clm", "folding", "prolong", "selfcompact", "autocompact", "acm", "ace",
+                        choices=["compaction", "clm", "folding", "prolong", "selfcompact", "autocompact", "acm", "ace", "jev", "headroom",
                                  "mem1", "rlm", "rlm_persistent"],
                         help="OpenContext's strategy (clm: the model edits its own context)")
     parser.add_argument("--steering", help="with --strategy clm: a brief from tests/docker/steering (compaction, "

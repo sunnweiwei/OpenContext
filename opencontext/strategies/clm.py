@@ -11,8 +11,10 @@ the file. The file's format follows pi-clm, the authors' adaptation of CLM to a 
 because OpenContext's turns carry structure the paper's plain-text turns do not: a metadata line, then
 one `[[CTX_TURN ...]]` block per turn, each bound to its turn by an id, so that untouched blocks
 stay the original items (tool calls, reasoning and images intact). An edited user, assistant or
-tool-result turn keeps its place with the new text (a result still answers its call; its images
-stay); any other edited block, and every new one (`id=new-*`, any role label), becomes a user-role
+tool-result turn keeps its place with the new text (a result still answers its call). A turn's
+media show as `[image N of this turn, ~T tokens]` lines: an edited turn keeps those whose lines it
+kept, so the model can drop an image and keep the text. So do the task's, in a block of their own
+(`id=task`): its text stays protected, its attachments are the model's to drop. Any other edited block, and every new one (`id=new-*`, any role label), becomes a user-role
 note labelled with that role; removed blocks are gone; the document's order is followed. A tool
 call kept without its result, or a result without its call, is told as a note when the request is
 sent (OpenContext does that for every strategy, and only for those items). A file with no block headers
@@ -47,6 +49,7 @@ from threading import Lock
 from typing import Any
 
 from ..core.ir import LABELS, Context, Item, Kind, Request, note
+from ..core.media import counted, kept, lines
 from ..core.tokens import item_tokens
 from .base import Summarizer
 from .compaction import Compaction
@@ -116,6 +119,9 @@ ATTRIBUTE = re.compile(r"(document|index|role|id)=([\w-]+)")
 LABEL = re.compile(r"\[context role=([A-Za-z][\w-]*)\]\n")  # how a note carries its role
 STRUCTURAL = re.compile(r"^(\\*)(\[\[(?:CTX_TURN|LIVE_CONTEXT) )", re.M)  # escaped inside bodies
 NO_TEXT = "[no text: encrypted or media content]"
+ATTACHED = ("# A turn's attachments are its [image N of this turn, ...] lines: keep a line to keep its attachment, delete "
+            "it to drop that. Block id=task holds the task's: its text is protected, only these lines can change.")
+TASK = "task"  # the block of the task's attachments
 
 
 @dataclass(frozen=True)
@@ -158,7 +164,7 @@ class ContextLanguageModel:
         if compacted is not None:
             tokens = request.tokens - sum(map(item_tokens, request.current)) + sum(map(item_tokens, compacted.items))
             request, recovered = replace(request, current=compacted.items, tokens=tokens), True
-            state = {key: state[key] for key in ("file", "ids", "revision") if key in state}  # (the file, rewritten)
+            state = {key: state[key] for key in ("file", "named", "ids", "revision") if key in state}  # (the file, rewritten)
         path = Path(self.directory) / state.get("file", f"{request.conversation}.md")
         budget = self.budget or request.window or 0
         limit = max(budget - self.reserve, 0)
@@ -177,7 +183,8 @@ class ContextLanguageModel:
             items, tokens, notice = _guard(items, tokens, limit, anchor, path)
             notes += [notice] if notice else []
         revision = state.get("revision", 0) + (recovered or items != list(request.current))
-        text = _render(items[task:], _document(request.conversation, revision), revision)
+        named = state.get("named", request.conversation)  # (the conversation's name settles only after the first reply)
+        text = _render(items[task:], _document(named, revision), revision, items[task - 1] if task else None)
         _write(path, text)
         _own(path, _ids(items[task:]))
         nudged = state.get("nudged", [])
@@ -192,7 +199,7 @@ class ContextLanguageModel:
         guidance = Item(Kind.SYSTEM, f"{guidance}\n\n{STEERING}\n\n{self.steering}" if self.steering else guidance)
         return Context((guidance, *items),
                        {"revision": revision, "digest": _digest(text), "ids": _ids(items[task:]), "nudged": nudged,
-                        "file": path.name, "anchor": anchor},
+                        "file": path.name, "named": named, "anchor": anchor},
                        tuple(notes))
 
     def _nudge(self, tokens: int, budget: int, limit: int, nudged: list[float]) -> tuple[list[float], str | None]:
@@ -221,7 +228,7 @@ def _apply(edited: str, request: Request, task: int, state: dict[str, Any],
     snapshot, end = current[task: task + len(state["ids"])], task + len(state["ids"])
     if _ids(snapshot) != state["ids"] or end not in request.boundaries:
         return None, before, "[context file: edit NOT applied — the conversation changed after the file was written.]"
-    document = _document(request.conversation, state["revision"])
+    document = _document(state["named"], state["revision"])
     meta = META.format(revision=state["revision"], document=document)
     # A header is read by its attributes (any order; `index` is descriptive); one that cannot be
     # read is refused, never taken for text.
@@ -234,7 +241,7 @@ def _apply(edited: str, request: Request, task: int, state: dict[str, Any],
         blocks.append((header, attributes))
     head: list[Item] = []
     if not blocks:  # plain text: everything after the task becomes one note
-        body = _unescape("\n".join(line for line in edited.splitlines() if line not in (meta, COMMENT))).strip()
+        body = _unescape("\n".join(line for line in edited.splitlines() if line not in (meta, COMMENT, ATTACHED))).strip()
         if not body:
             return None, before, "[context file: edit NOT applied — the file is empty.]"
         head.append(note("notes", body))
@@ -242,16 +249,19 @@ def _apply(edited: str, request: Request, task: int, state: dict[str, Any],
         if edited.lstrip().startswith("[[LIVE_CONTEXT ") and not edited.lstrip().startswith(meta):  # (headers name the version too)
             return None, before, f"[context file: edit NOT applied — keep its first line exactly as it was: {meta}]"
         by_id = {id_: n for n, id_ in enumerate(state["ids"])}
-        preamble = "\n".join(line for line in edited[: blocks[0][0].start()].splitlines() if line not in (meta, COMMENT))
+        preamble = "\n".join(line for line in edited[: blocks[0][0].start()].splitlines()
+                             if line not in (meta, COMMENT, ATTACHED))
         if preamble.strip():
             head.append(note("notes", _unescape(preamble).strip()))
         seen: set[str] = set()
         for n, (header, attributes) in enumerate(blocks):
             id_ = attributes["id"]
             body = _unescape(edited[header.end(): blocks[n + 1][0].start() if n + 1 < len(blocks) else len(edited)]).strip()
-            if id_ in seen or not (id_ in by_id or id_.startswith("new-")):
+            if id_ in seen or not (id_ in by_id or id_ == TASK or id_.startswith("new-")):
                 return None, before, f"[context file: edit NOT applied — block id {id_} is {'repeated' if id_ in seen else 'unknown'}.]"
             seen.add(id_)
+            if id_ == TASK:
+                continue
             if not body:
                 continue  # removed
             item = snapshot[by_id[id_]] if id_ in by_id else None
@@ -259,12 +269,17 @@ def _apply(edited: str, request: Request, task: int, state: dict[str, Any],
             if item is not None and (role, body) == _shown(item):
                 head.append(item)
             elif item is not None and role == _shown(item)[0]:
-                head.append(replace(item, text=body))  # new text, same turn: a result still answers its call
+                head.append(kept(item, body))  # new text, same turn: a result still answers its call
             else:
                 head.append(note(role, body))
     # As it will be sent: what the protocol cannot keep where it stands (a call whose result was
     # removed) is told as a note, the rest stays as written.
-    items = list(request.sendable((*current[:task], *head, *current[end:])))
+    protected = list(current[:task])
+    if blocks and task and protected[-1].media:  # (its text stays whatever the block says: `kept` only for its media)
+        body = next((edited[h.end(): blocks[n + 1][0].start() if n + 1 < len(blocks) else len(edited)]
+                     for n, (h, attributes) in enumerate(blocks) if attributes["id"] == TASK), "")
+        protected[-1] = replace(protected[-1], media=kept(protected[-1], body).media)
+    items = list(request.sendable((*protected, *head, *current[end:])))
     after = before - _size(current) + _size(items)
     if limit and after > before and after > limit:  # the paper's default gate: an edit must fit
         return None, before, (f"[context file: edit REJECTED — it GREW context ~{before}->{after} tokens, so it was NOT "
@@ -291,13 +306,18 @@ def _guard(items: list[Item], tokens: int, limit: int, anchor: int, path: Path) 
         if tokens <= limit:
             break
         item = items[n]
-        if item.kind is not Kind.TOOL_RESULT or item.text.startswith(WITHHELD) or not item.text.strip():
+        if item.kind is not Kind.TOOL_RESULT or item.text.startswith(WITHHELD) or not (item.text.strip() or item.media):
             continue
         size, file = item_tokens(item), path.parent / "withheld" / f"{path.stem}.{_digest(item.text)[:12]}.txt"
-        _write(file, item.text)
-        items[n] = replace(item, text=f"{WITHHELD} tool result (~{size:,} tokens) withheld over budget. Full text: {file}",
-                           media=())
-        tokens += item_tokens(items[n]) - size
+        told = (f" Full text: {file}" if item.text.strip() else "") + (f" Its {counted(item.media)} went with it." if item.media else "")
+        replacement = replace(item, text=f"{WITHHELD} tool result (~{size:,} tokens) withheld over budget.{told}", media=())
+        saved = size - item_tokens(replacement)
+        if saved <= 0:
+            continue  # A short result must not grow into a longer file-path note.
+        if item.text.strip():
+            _write(file, item.text)
+        items[n] = replacement
+        tokens -= saved
         withheld += 1
     if not withheld:
         return items, tokens, None
@@ -310,18 +330,21 @@ def _guard(items: list[Item], tokens: int, limit: int, anchor: int, path: Path) 
         "with offset/limit.")
 
 
-def _render(items: list[Item], document: str, revision: int) -> str:
+def _render(items: list[Item], document: str, revision: int, task: Item | None = None) -> str:
     blocks = [f"{HEADER.format(document=document, index=n, role=role, id=id_)}\n{_escape(body)}"
               for n, (item, id_) in enumerate(zip(items, _ids(items)), start=1) for role, body in [_shown(item)]]
-    return "\n\n".join([META.format(revision=revision, document=document), COMMENT, *blocks]) + "\n"
+    if task is not None and task.media:
+        blocks.insert(0, f"{HEADER.format(document=document, index=0, role='user', id=TASK)}\n{lines(task)}")
+    attached = [ATTACHED] if any(item.media for item in (*items, *([task] if task else []))) else []
+    return "\n\n".join([META.format(revision=revision, document=document), COMMENT, *attached, *blocks]) + "\n"
 
 
 def _shown(item: Item) -> tuple[str, str]:
-    """The role label and text a block shows for an item."""
+    """The role label and text a block shows for an item, a line for each of its media."""
 
     if item.ref is None and item.kind is Kind.USER and (label := LABEL.match(item.text)):
-        return label.group(1), item.text[label.end():].strip()
-    return LABELS.get(item.kind, item.kind.value), item.text.strip() or NO_TEXT
+        return label.group(1), "\n".join(filter(None, (item.text[label.end():].strip(), lines(item))))
+    return LABELS.get(item.kind, item.kind.value), "\n".join(filter(None, (item.text.strip(), lines(item)))) or NO_TEXT
 
 
 def _ids(items: list[Item] | tuple[Item, ...]) -> list[str]:

@@ -5,19 +5,28 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Any
+
+import httpx
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 from opencontext import Compaction, Engine, PrefixStore, ProxyConfig, create_app
 from opencontext import intercept
 from opencontext.integrations import ClaudeCodeHook
 from opencontext.prompts import SUMMARY_PREFIX
-from opencontext.protocols import OpenAIResponses
-from opencontext.strategies import ContextFolding
+from opencontext.protocols import AnthropicMessages, OpenAIResponses
+from opencontext.strategies import ContextFolding, Headroom, Jev
+from opencontext.strategies.jev import STATE_CONTEXT
 from tests.fakes import COMPACTION_MARKER, FINAL_TEXT, FakeUpstream, local_upstreams, serve
 
 
@@ -230,6 +239,135 @@ class ClaudeCodeHttpsTests(unittest.TestCase):
         self.assertFalse([r for r in requests if "thread" in r["body"]])  # (no server-side thread: OpenContext sees it all)
         self.assertNotIn("compact_boundary", transcript)  # (Claude Code never compacted: it saw nothing)
         self.assertNotIn(SUMMARY_PREFIX, transcript)
+
+
+class JevEndToEndTests(unittest.TestCase):
+    """`jev` with each harness: Jev (here a fake that keeps every call and no result in full) is asked
+    about the older calls, and the requests that follow carry their results cut to the library's head
+    and note (where that frees too little, compaction compacts instead)."""
+
+    def run_harness(self, harness: str) -> None:
+        if shutil.which(harness) is None:
+            self.skipTest(f"{harness} is not installed")
+        path, key, _ = HarnessEndToEndTests.cases[harness]
+        # (above the harness's own request with a few calls: with only the newest, pinned, there is
+        # nothing to ask about, and too little to free falls back to compaction)
+        threshold, asked = {"codex": 13_500, "claude": 16_500}[harness], []
+
+        async def answer(request: Request) -> JSONResponse:
+            body = await request.json()
+            asked.append({**body, "authorization": request.headers.get("authorization")})
+            return JSONResponse({"answers": {name: {"noul": 0.9 if name.startswith("call_") else 0.1}
+                                             for name in body["questions"]}})
+
+        fake = FakeUpstream(tool_calls=10, command="seq 1 300")
+        jev_app = Starlette(routes=[Route("/v1/systemone", answer, methods=["POST"])])
+        with serve(fake.app) as upstream, serve(jev_app) as jev, tempfile.TemporaryDirectory() as root:
+            strategy = Jev(trigger=Compaction(threshold=threshold), fallback=Compaction(threshold=threshold),
+                           api_key="jev-key", url=f"{jev}/v1/systemone")
+            home, work = Path(root, "home"), Path(root, "work")
+            home.mkdir(), work.mkdir()
+            env = _env(home)
+            with serve(create_app(Engine(strategy, PrefixStore()), ProxyConfig(upstreams=local_upstreams(upstream)))) as opencontext:
+                if harness == "codex":
+                    (home / "config.toml").write_text(
+                        'model = "gpt-5.1-codex"\nmodel_provider = "opencontext"\n[model_providers.opencontext]\n'
+                        f'name = "OpenContext"\nbase_url = "{opencontext}/v1"\nenv_key = "OPENCONTEXT_TEST_KEY"\n'
+                        'wire_api = "responses"\nsupports_websockets = false\n')
+                    env["OPENCONTEXT_TEST_KEY"] = "tenant"
+                else:
+                    env.update(ANTHROPIC_BASE_URL=opencontext, ANTHROPIC_API_KEY="tenant")
+                for command in _commands(harness, work):
+                    result = subprocess.run(command, cwd=work, env=env, stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=180)
+                    self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+                    self.assertIn(FINAL_TEXT, result.stdout)
+        self.assertTrue(asked)
+        self.assertEqual({(a["model"], a["authorization"], a["state"]["context"]) for a in asked},
+                         {("jev-latest", "Bearer jev-key", STATE_CONTEXT)})
+        cut = [body for b in fake.bodies(path) if "[fast-jev-compaction truncated" in (body := json.dumps(b[key]))]
+        self.assertTrue([body for body in cut if SUMMARY_PREFIX not in body])  # (Jev's context, no summary)
+
+    def test_codex(self) -> None:
+        self.run_harness("codex")
+
+    def test_claude_code(self) -> None:
+        self.run_harness("claude")
+
+
+class HeadroomEndToEndTests(unittest.TestCase):
+    """`headroom` with each harness and a real Headroom (`headroom proxy`, in the test image): the log
+    each command prints goes compressed, its ERROR line kept, and each request forwards what the ones
+    before it forwarded as it was (the prompt cache holds)."""
+
+    LOG = ('for i in $(seq 1 400); do echo "2026-11-04 10:00:00 INFO request $i served in 12ms"; done; '
+           'echo "2026-11-04 10:07:00 ERROR disk full: CODE amber"')
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if shutil.which("headroom") is None:
+            raise unittest.SkipTest("Headroom is not installed")
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        cls.url, cls.home = f"http://127.0.0.1:{port}", tempfile.TemporaryDirectory()
+        env = {**os.environ, "HOME": cls.home.name, "HEADROOM_TELEMETRY": "off", "HEADROOM_BEACON": "off", "DO_NOT_TRACK": "1"}
+        cls.headroom = subprocess.Popen(["headroom", "proxy", "--port", str(port)], env=env,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(300):
+            try:
+                httpx.get(f"{cls.url}/health", timeout=2)
+                return
+            except httpx.HTTPError:
+                time.sleep(0.2)
+        cls.tearDownClass()
+        raise RuntimeError("Headroom did not start")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.headroom.terminate()
+        cls.headroom.wait(timeout=30)
+        cls.home.cleanup()
+
+    def run_harness(self, harness: str) -> None:
+        if shutil.which(harness) is None:
+            self.skipTest(f"{harness} is not installed")
+        path, key, _ = HarnessEndToEndTests.cases[harness]
+        fake = FakeUpstream(tool_calls=4, command=self.LOG)
+        with serve(fake.app) as upstream, tempfile.TemporaryDirectory() as root:
+            home, work = Path(root, "home"), Path(root, "work")
+            home.mkdir(), work.mkdir()
+            env = _env(home)
+            with serve(create_app(Engine(Headroom(url=self.url), PrefixStore()), ProxyConfig(upstreams=local_upstreams(upstream)))) as opencontext:
+                if harness == "codex":
+                    (home / "config.toml").write_text(
+                        'model = "gpt-5.1-codex"\nmodel_provider = "opencontext"\n[model_providers.opencontext]\n'
+                        f'name = "OpenContext"\nbase_url = "{opencontext}/v1"\nenv_key = "OPENCONTEXT_TEST_KEY"\n'
+                        'wire_api = "responses"\nsupports_websockets = false\n')
+                    env["OPENCONTEXT_TEST_KEY"] = "tenant"
+                else:
+                    env.update(ANTHROPIC_BASE_URL=opencontext, ANTHROPIC_API_KEY="tenant")
+                for command in _commands(harness, work):
+                    result = subprocess.run(command, cwd=work, env=env, stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=180)
+                    self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+                    self.assertIn(FINAL_TEXT, result.stdout)
+        codec = OpenAIResponses() if harness == "codex" else AnthropicMessages()
+        sent = [[codec.canonical(item) for item in body[key]] for body in fake.bodies(path)]
+        last = json.dumps(fake.bodies(path)[-1][key])
+        self.assertIn("lines omitted", last)
+        self.assertIn("ERROR disk full: CODE amber", last)
+        self.assertNotIn("request 200 served", last)
+        for n, items in enumerate(sent):  # (of the same conversation: the same first item)
+            if earlier := [before for before in sent[:n] if before[:1] == items[:1] and len(before) <= len(items)]:
+                longest = max(earlier, key=len)
+                self.assertEqual(items[: len(longest)], longest, f"request {n} changed what was forwarded")
+
+    def test_codex(self) -> None:
+        self.run_harness("codex")
+
+    def test_claude_code(self) -> None:
+        self.run_harness("claude")
 
 
 class PiEndToEndTests(unittest.TestCase):

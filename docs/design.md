@@ -20,6 +20,8 @@ opencontext setup codex --strategy clm   # or: claude, gemini_cli, pi, opencode,
 codex                              # use the harness exactly as before
 opencontext strategy folding             # another strategy, for every conversation from its next request
 opencontext status                       # whether OpenContext runs, its strategy, the harnesses set up
+opencontext doctor                       # whether each harness really goes through OpenContext (a config rewritten
+                                   # by another tool, the shell's variables), and OpenContext to its provider
 opencontext uninstall codex              # restore its configuration (--all: every harness set up)
 opencontext help                         # the guide, for people and for agents setting OpenContext up
 ```
@@ -424,7 +426,8 @@ original task are protected, as there: they stay out of the file. The file's for
 the authors' adaptation of CLM to a coding harness: a metadata line, then one
 `[[CTX_TURN ... id=...]]` block per turn. Untouched blocks stay the original items, byte for byte
 (tool calls, reasoning and images intact); an edited user, assistant or tool-result turn keeps its
-place with the new text (a result still answers its call, and keeps its images); an edited tool
+place with the new text (a result still answers its call), and the images whose `[image N of this
+turn, ~T tokens]` lines it kept; an edited tool
 call or reasoning item, and every block the model adds (`id=new-*`, any role label), becomes a
 user-role note labelled with the role; a tool call left without its result (or the reverse), or
 reasoning away from the item it preceded, is told as a note when the request is sent, and nothing
@@ -536,7 +539,8 @@ to search only what it needs there with `rg`, `grep`, `jq` or a script. The log 
 prompt, and reading it is not recorded. PRO-LONG writes the log from each harness's hooks; OpenContext
 writes it from the requests, so it works in every harness. It matters once the context loses
 something, so it runs around compaction (the `compact_*` settings apply): compaction decides
-what the model sees, the log keeps everything.
+what the model sees, the log keeps everything. An event's images are saved beside the log
+(`images/`, one file per image) and the event names their files, so the agent can open one again.
 
 Checked in Docker with `check.py --strategy prolong`: each file also names an animal, which turn 1
 does not ask for and turn 2 does, after a compaction, without the files. In all 18 two-turn
@@ -561,7 +565,9 @@ without ground truth, `ACE_online_no_GT`):
 - the playbook is in every request, in the words of ACE's generator prompt (`### PLAYBOOK BEGIN`);
 - a task ends when the agent ends it (AppWorld's `complete_task()`; here, a turn the agent closes
   with a reply and no tool call). Then ACE's reflector diagnoses the task's whole trajectory, and
-  ACE's curator turns the reflection into `ADD` operations, the only ones ACE's agent setup takes;
+  ACE's curator turns the reflection into `ADD` operations, the only ones ACE's agent setup takes.
+  Both get the task's images, each marked `[image N]` in the history where it was (ACE's own
+  trajectories are text);
 - additions are merged by ACE's rules (`playbook.py`): a fresh id (`[vc-00012]`), at the end of
   its section (ACE's eight), else of OTHERS; operations outside ACE's sections are skipped, and an
   answer that is not ACE's JSON, or holds an operation other than `ADD`, adds nothing. The file
@@ -578,6 +584,77 @@ trims old outputs itself): past the compaction threshold the conversation is com
 (`tests/docker/check.py --strategy ace`): after turn 1 the reflector and the curator ran, the
 playbook gained bullets, and every request of turn 2 carried them.
 
+## fast-jev-compaction
+
+[fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction) (`opencontext/strategies/jev.py`,
+MIT) compacts without summarizing: TypeSafe's Jev, a model that answers typed questions with
+probabilities and writes no text, decides which tool calls and results are still needed, and the
+rest of the conversation stays verbatim, in order. It follows the library and its Claude Code
+plugin as they are:
+
+- when the context reaches 60% of the window (the plugin's `compactAtPercent`; `compact_ratio`, or
+  the other `compaction` triggers), every tool call outside the first message and the newest six gets
+  the library's two `noul` questions: should the call stay, and should its result stay verbatim;
+- Jev's state is the whole conversation, oldest first, each result told by its size and long texts
+  abridged, shrunk in the library's stages to 25k tokens; the questions go in as many requests as fit
+  30k beside it, at once;
+- a call whose result Jev keeps (0.5 or more) stays as it is; one whose call it keeps keeps the
+  first 300 characters of its result and the library's note (its images go too, and the note says
+  so); the others go, with their results. A result's images are part of its size as Jev is told it,
+  and of the share freed, which is counted in tokens;
+- where Jev cannot answer (no key, an error, a history it cannot fit) or the result frees less than
+  a quarter of the conversation (as the library counts it: not the harness's instructions and tools),
+  `compaction` compacts it then, as the plugin falls back to Claude Code's own summary. OpenContext's log
+  has each run's share freed and Jev's decision on each call, as the plugin's.
+
+OpenContext sees a model response's calls and their results as one cut of the conversation (an Anthropic
+message holds all of a response's results), so a response's calls are kept or dropped together, as
+much as the one of them Jev keeps most; where the protocol writes the model's text (and thinking)
+in the message of its calls (Anthropic, Chat Completions, Gemini), it goes with them. A result is
+told to Jev by its size alone, without the library's `ok` or `error`, which OpenContext cannot tell.
+The state, the questions and their batches are the library's: run on the same conversations,
+fast-jev-compaction's own code and OpenContext's give the same state at each stage, the same token
+estimates and the same batches, but for the `ok` (checked against its commit e3f262a).
+
+Jev is TypeSafe's API (`opencontext set jev_api_key=...`, or `TYPESAFE_API_KEY`), or OpenRouter's, with
+the same requests (`jev_url`, `jev_model`; see [Configuration](#configuration)). What Jev reads (the
+conversation, results by size) goes to that service.
+
+## Headroom
+
+[Headroom](https://github.com/headroomlabs-ai/headroom) (`opencontext/strategies/headroom.py`, Apache-2.0)
+compresses each tool result in place as it comes in, by what it holds, and leaves the rest alone:
+nothing is dropped, summarized or reordered. OpenContext asks Headroom itself, as its proxy runs by default
+(the `coding` profile, `cache` mode):
+
+- only the newest delta is compressed; what was forwarded is forwarded again as it was, so the
+  provider's prompt cache holds;
+- its ContentRouter picks one compressor per result: a JSON array becomes a table (SmartCrusher), a
+  log keeps its errors and the lines around them, search results and diffs their hits; a file read
+  stays verbatim (`protect_reads`, `cat` included), and the same output again points at the first;
+- the profile compresses the user's messages too: a long one loses function words, the instructions
+  in it included ("wait until you have seen its output" becomes "wait until you seen its output").
+
+```sh
+pip install "headroom-ai[proxy]"   # (in its own environment)
+headroom proxy --port 8790         # (its own default port, 8787, is OpenContext's)
+opencontext strategy headroom
+```
+
+OpenContext sends the conversation to the endpoint Headroom offers gateways, `POST /v1/compress`, as OpenAI
+Chat messages, with every message it forwarded before frozen (`frozen_message_count`). That endpoint
+is marker-free by default: Headroom's proxy also keeps the originals and gives the model a
+`headroom_retrieve` tool to get them back (CCR), which takes answering the model's own tool calls.
+`opencontext set headroom_mode=ccr` asks for the markers, for a harness given Headroom's MCP server
+(`headroom mcp`), whose tool reads the same store. Without it, a model that wants what was omitted
+runs the tool again: Codex with GPT-6 Luna once ran a log's command again with the output wrapped in
+JSON, which Headroom leaves as it is, and fetched every later log that way. Where an Anthropic or Gemini message answers calls
+of several tools at once (OpenContext sees its results as one), it stays as it is: Headroom treats each
+tool's output by its own rules. Headroom never shrinks a conversation: behind its proxy the harness's
+own compaction does, so here `compaction` does, at the same point (its settings apply). On Gemini's API Headroom's own proxy leaves function responses as they
+are; OpenContext gives it the output in them, as on the other APIs, so the method is the same on every harness. Where Headroom does not answer, the results go as they are, and stay
+so. The conversation goes to that Headroom (local, unless `headroom_url` says otherwise).
+
 ## The CLM paper's baselines
 
 The CLM paper compares against methods that manage context through predefined actions or a
@@ -588,11 +665,11 @@ guidance asks the agent to `echo` a signal, and the echo's result is rewritten i
 | Baseline | `strategy` | What OpenContext does | Prompts |
 | --- | --- | --- | --- |
 | Summary | `compaction` with `opencontext set compact_ratio=0.75` | Codex's compaction at 75% of the budget (the paper's summary harness) | Codex's |
-| Self-Compact ([arXiv 2606.23525](https://arxiv.org/abs/2606.23525)) | `selfcompact` | every two model responses once the prompt passes 37% of the window, appends the rubric to the conversation (prompt cache reused); C1 = C2 = C3 = Y and N1 = N fires the summarizer, and the summary replaces the trajectory (the user's messages stay); past 95% it summarizes without asking | the paper's rubric and summarizer, verbatim |
+| Self-Compact ([arXiv 2606.23525](https://arxiv.org/abs/2606.23525)) | `selfcompact` | every two model responses once the prompt passes 37% of the window, appends the rubric to the conversation (prompt cache reused); C1 = C2 = C3 = Y and N1 = N fires the summarizer, and, as Self-Compact's agent resets it, the context becomes the original question, the summary as the assistant's ("Here is my research so far:") and the user's "continue" (the user's later messages go with the rest); past 95% it summarizes without asking | its released code's rubric, summarizer (the `<summary>` block taken) and continue message, verbatim |
 | AutoCompact ([autocompact.github.io](https://autocompact.github.io/)) | `autocompact` | the agent runs `echo "[compact]"` at a phase transition; the same model writes an "# Auto Context Summary", which answers the call, and the context becomes the user's messages, the turn before the call and the summary; Codex's compaction stays as the fallback (`compact_*`) | none released; written from its description |
-| ACM ([github](https://github.com/lixiaochuan2020/agentic-context-management)) | `acm` | `echo "[manage_context]"` compresses everything since the previous call into "[summary_id: N] ...", the originals saved to `acm_dir/<conversation>/summary_N.json`; `echo "[query_memory] N :: query"` answers from them; every request after a tool result ends with "[CURRENT CONTEXT TOKEN: N]" | ACM's summarizer and recall prompts, verbatim; its guidance worded for a shell |
+| ACM ([github](https://github.com/lixiaochuan2020/agentic-context-management)) | `acm` | `echo "[manage_context]"` compresses everything since the previous call (at first, since the original question, which stays, as in ACM's runner; the user's later messages are compressed too) into "[summary_id: N] ...", the originals saved to `acm_dir/<conversation>/summary_N.json`; `echo "[query_memory] N :: query"` answers from them; every request after a tool result ends with "[CURRENT CONTEXT TOKEN: N]" | ACM's summarizer and recall prompts, verbatim; its guidance worded for a shell; a compressed range's images go to the summarizer and are saved with the originals (the release serializes text only) |
 | MEM1 ([github](https://github.com/MIT-MI/MEM1)) | `mem1` | the model writes its internal state in `<IS>` every response; the context is cut back to the newest response holding one (the user's messages stay) | MEM1's, for an agent's tools |
-| RLM ([github](https://github.com/alexzhang13/rlm)) | `rlm`, `rlm_persistent` | before every step the authors' RLM works out the agent's next step, the conversation held as `context` in its REPL; its answer is all the task's model sees of the conversation, and that model, with the harness's tools, takes the step. `rlm` is a fresh query every request (the whole conversation again, nothing cached); `rlm_persistent` is the authors' multi-turn mode: the conversation's REPL stays, each request adds only what is new as `context_k`, and earlier work stays in `history_k` and in the model's variables | the authors' (`rlms` 0.1.3); the root prompt asks for the next step |
+| RLM ([github](https://github.com/alexzhang13/rlm)) | `rlm`, `rlm_persistent` | before every step the authors' RLM works out the agent's next step, the conversation held as `context` in its REPL; its answer is all the task's model sees of the conversation, and that model, with the harness's tools, takes the step. `rlm` is a fresh query every request (the whole conversation again, nothing cached); `rlm_persistent` is the authors' multi-turn mode: the conversation's REPL stays, each request adds only what is new as `context_k`, and earlier work stays in `history_k` and in the model's variables. The REPL holds text, each image marked where it was; the conversation's newest images go with the answer to the model that takes the step | the authors' (`rlms` 0.1.3); the root prompt asks for the next step |
 | Context Folding | `folding` | see above | FoldAgent's |
 
 Base is OpenContext without a strategy that changes anything. AutoCompact and MEM1 train their models to
@@ -692,16 +769,18 @@ starts, and `opencontext set` restarts the service for them.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `strategy` | `compaction` | The strategy: `compaction` (Codex's), `clm` (the model edits its own context), `folding` (the agent branches and returns), `prolong` (compaction, and a log the agent searches), or one of the CLM paper's baselines: `selfcompact`, `autocompact`, `acm`, `ace` (a playbook of lessons across conversations), `mem1`, `rlm`, `rlm_persistent`. |
+| `strategy` | `compaction` | The strategy: `compaction` (Codex's), `clm` (the model edits its own context), `folding` (the agent branches and returns), `prolong` (compaction, and a log the agent searches), `jev` (fast-jev-compaction: Jev deletes the tool calls and results no longer needed), `headroom` (Headroom compresses each tool result in place), or one of the CLM paper's baselines: `selfcompact`, `autocompact`, `acm`, `ace` (a playbook of lessons across conversations), `mem1`, `rlm`, `rlm_persistent`. |
 | `rlm_max_iterations`, `rlm_max_depth` | `30`, `1` | RLM: root turns per step, and recursion depth (1: sub-calls are plain model calls), the authors' defaults. |
 | `rlm_environment` | `local` | RLM: where the model's code runs; `local` is OpenContext's own process. |
 | `acm_dir` | `/tmp/.acm` | ACM: where the compressed messages are saved, a folder per conversation (OpenContext reads them back for `query_memory`). |
 | `ace_playbook` | `ace_playbook.md` in OpenContext's directory | ACE: the playbook's file, shared by every conversation. |
 | `prolong_log` | `/tmp/.prolong/log.jsonl` | PRO-LONG: the session log; the harness's tools must be able to read it (OpenContext writes a `.gitignore` next to it). |
 | `compact_threshold` | `compact_ratio` × context window | Prompt tokens that trigger compaction. |
-| `compact_ratio` | `0.9` | Share of the model's context window used when no threshold is set. |
+| `compact_ratio` | `0.9` (`jev`: `0.6`) | Share of the model's context window used when no threshold is set. |
+| `jev_api_key`, `jev_url`, `jev_model` | `TYPESAFE_API_KEY`, TypeSafe's `https://api.typesafe.ai/v1/systemone`, `jev-latest` | `jev`: where Jev answers. OpenRouter's: `jev_url=https://openrouter.ai/api/alpha/decisions`, `jev_model=~typesafe/jev-latest`, with an OpenRouter key. |
+| `headroom_url`, `headroom_mode`, `headroom_model`, `headroom_token` | `http://127.0.0.1:8790`, unset, `claude-sonnet-4-5-20250929`, unset | `headroom`: the Headroom to ask; its `config.mode` (`ccr`: retrieval markers, for a harness with Headroom's MCP tool; `lossy_inline`); the model whose tokenizer it counts with; its `HEADROOM_PROXY_TOKEN`, where it has one. |
 | `compact_growth` | unset | Instead of a threshold, compact after this many tokens were added since the context window began (Codex's `BodyAfterPrefix` scope); independent of each harness's fixed prompt overhead. |
-| `context_window` | from the model name | Overrides the context window table in `opencontext/providers.py`. |
+| `context_window` | from the model name | Overrides the context window table in `opencontext/providers.py`. An upstream that refuses a request as too long and names its limit (`N tokens > M maximum`, `maximum context length is M`) sets the window of that model to M from then on (an account's limit below the model's). |
 | `retain_user_tokens` | `20000` | Budget for recent user messages kept verbatim. |
 | `clm_budget` | context window | CLM: the context budget the model is told about; its limit is this less `clm_reserve` (`2048`). |
 | `clm_dir` | `/tmp/.live_ctx` | CLM: where the context files live; the harness's tools must be able to edit files there (inside the workspace for a sandboxed harness; OpenContext writes a `.gitignore` there). |
@@ -715,6 +794,7 @@ starts, and `opencontext set` restarts the service for them.
 | `harness` | detected | Force a harness profile by name, e.g. `codex`, `hermes`, `generic`. |
 | `event_log` | unset | Append one JSON line per compaction (sizes, timing, the new head, and the usage of the summary requests it made). |
 | `host`, `port` | `127.0.0.1`, `8787` | Server address for `opencontext serve`. |
+| `allow_network` | `false` | `true` lets OpenContext listen on another address than this machine's (`host`); otherwise it refuses, as anyone who reaches it could use it, and the API keys in its settings. |
 | `cache_max_entries`, `cache_max_bytes`, `cache_ttl_seconds`, `cache_secret` | `4096`, 256 MiB, 6 h, random | Limits of the prefix store. |
 | `cache_path` | `~/.opencontext/store-<port>.json` | Where the prefix store is kept (one file per OpenContext process; written in the background, at most once a second, and on shutdown), so a restarted OpenContext finds its contexts: compactions are not recomputed and CLM edits are not lost (`off`: in memory only). The file holds summaries and strategy state (conversation text), readable by its owner only; without `cache_secret`, a secret is generated once and kept beside it. |
 
@@ -723,6 +803,13 @@ Set `context_window` to the window the harness itself uses where the table in
 (shown as 258k usable), an unknown model falls back to 128k, and the 95% limit uses the same
 window, so setting only a threshold is not enough. OpenContext's threshold must also stay below the
 harness's own trigger (see [Harness auto-compaction](#harness-auto-compaction)).
+
+OpenContext's own connections to the providers trust what the harnesses do: the system's certificate store
+(where IT puts the root of a TLS-inspecting proxy such as Zscaler; Claude Code reads it too), the
+public roots and `NODE_EXTRA_CA_CERTS`, or `SSL_CERT_FILE` alone where it is set. They send TCP
+keepalive probes after a minute of silence, so a link that died while the model was still thinking
+(a laptop changing networks) ends in about two minutes instead of waiting forever. OpenContext's settings
+and the logs that hold conversations (`event_log`, `trace`) are its owner's alone.
 
 Other providers are configured by endpoint, for example
 `opencontext set openai_base_url=https://api.x.ai/v1` for Grok, or

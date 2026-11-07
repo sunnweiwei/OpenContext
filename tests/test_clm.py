@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import json
 import re
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -89,6 +91,15 @@ class ClmTests(unittest.TestCase):
         self.assertNotIn("output 1 x", json.dumps(sent.body))
         self.assertEqual(sent.body["input"][-3:-1], call(4))
 
+    def test_an_edit_on_the_first_turn_holds_though_the_conversation_is_named_later(self) -> None:
+        first = [msg("developer", "rules"), msg("user", "read the files"), msg("user", "batch " + "y" * 400)]
+        self.send(*first)
+        self.edit(lambda s: s.replace("batch " + "y" * 400, "[batch offloaded]"))
+        sent = self.send(*first, *call(1, "python3 edit.py"))
+        self.assertTrue(sent.compacted)
+        self.assertNotIn("y" * 400, json.dumps(sent.body))
+        self.assertIn("[context file: edit applied", sent.body["input"][-1]["content"][0]["text"])
+
     def test_a_broken_file_is_refused_and_says_why(self) -> None:
         self.send(*self.history)
         self.edit(lambda s: s.replace("revision=0", "revision=7"))
@@ -129,6 +140,69 @@ class ClmTests(unittest.TestCase):
         self.assertIn(self.history[2], sent)  # the call, as it was
         self.assertIn({**self.history[3], "output": "output 1: nothing found"}, sent)
         self.assertNotIn("[context role=", json.dumps(sent[:-1]))  # nothing lowered to a note
+
+    def test_a_turns_images_are_lines_the_model_keeps_or_deletes(self) -> None:
+        self.engine = Engine(ContextLanguageModel(budget=20_000, directory=str(self.directory)))
+        head = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + struct.pack(">II", 1920, 1080) + b"\x08\x02\x00\x00\x00"
+        screen = {"type": "input_image", "image_url": "data:image/png;base64," + base64.b64encode(head).decode()}
+        shot = [{"type": "function_call", "call_id": "c5", "name": "sh", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c5",
+                 "output": [{"type": "input_text", "text": "the dialog opened"}, screen]}]
+        self.send(*self.history, *shot)
+        text = self.mirror().read_text()
+        self.assertIn("the dialog opened\n[image 1 of this turn, ~2,765 tokens]", text)
+        self.assertIn("keep a line to keep its attachment", text)
+        self.edit(lambda s: s.replace("the dialog opened", "the save dialog opened"))
+        sent = json.dumps(self.send(*self.history, *shot, *call(6)).body["input"])
+        self.assertIn("the save dialog opened", sent)
+        self.assertIn(screen["image_url"], sent)
+        self.edit(lambda s: s.replace("\n[image 1 of this turn, ~2,765 tokens]", ""))
+        sent = json.dumps(self.send(*self.history, *shot, *call(6), *call(7)).body["input"])
+        self.assertIn("the save dialog opened", sent)
+        self.assertNotIn(screen["image_url"], sent)
+
+    def test_a_file_is_a_line_as_an_image_is(self) -> None:
+        self.engine = Engine(ContextLanguageModel(budget=20_000, directory=str(self.directory)))
+        report = {"type": "input_file", "file_data": "data:application/pdf;base64," + "A" * 4000, "filename": "report.pdf"}
+        shot = [{"type": "function_call", "call_id": "c5", "name": "sh", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c5", "output": [{"type": "input_text", "text": "fetched"}, report]}]
+        self.send(*self.history, *shot)
+        self.assertIn("fetched\n[file 1 of this turn, ~188 tokens]", self.mirror().read_text())
+        self.edit(lambda s: s.replace("fetched\n[file 1 of this turn, ~188 tokens]", "fetched"))
+        sent = json.dumps(self.send(*self.history, *shot, *call(6)).body["input"])
+        self.assertNotIn("report.pdf", sent)
+        self.assertIn("fetched\\n[1 file removed]", sent)
+
+    def test_the_tasks_attachments_are_the_models_to_drop_and_its_text_is_not(self) -> None:
+        self.engine = Engine(ContextLanguageModel(budget=20_000, directory=str(self.directory)))
+        head = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + struct.pack(">II", 750, 100) + b"\x08\x02\x00\x00\x00"
+        screen = {"type": "input_image", "image_url": "data:image/png;base64," + base64.b64encode(head).decode()}
+        task = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "what is this"}, screen]}
+        history = [msg("developer", "rules"), task, *call(1), *call(2)]
+        self.send(*history)
+        text = self.mirror().read_text()
+        self.assertRegex(text, r"index=0 role=user id=task\]\]\n\[image 1 of this turn, ~100 tokens\]")
+        self.assertNotIn("what is this", text)
+        self.edit(lambda s: s.replace("[image 1 of this turn, ~100 tokens]\n", "not what it asked\n"))
+        sent = self.send(*history, *call(3))
+        self.assertNotIn(screen["image_url"], json.dumps(sent.body["input"]))
+        self.assertIn("what is this", json.dumps(sent.body["input"]))
+        self.assertNotIn("not what it asked", json.dumps(sent.body["input"]))
+        self.assertNotIn("id=task", self.mirror().read_text())
+
+    def test_a_task_without_attachments_has_no_block(self) -> None:
+        self.send(*self.history)
+        self.assertNotIn("id=task", self.mirror().read_text())
+
+    def test_a_result_of_images_alone_gives_way_to_the_overflow_guard(self) -> None:
+        self.engine = Engine(ContextLanguageModel(budget=20_000, directory=str(self.directory)))
+        head = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + struct.pack(">II", 1920, 1080) + b"\x08\x02\x00\x00\x00"
+        screen = {"type": "input_image", "image_url": "data:image/png;base64," + base64.b64encode(head).decode()}
+        shots = [item for n in range(5, 15) for item in (
+            {"type": "function_call", "call_id": f"c{n}", "name": "sh", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": f"c{n}", "output": [screen]})]
+        sent = json.dumps(self.send(*self.history, *shots).body["input"])
+        self.assertIn("withheld over budget. Its 1 image went with it.", sent)
 
     def test_the_harnesss_context_stays_where_it_was_sent(self) -> None:
         codex = HARNESSES["codex"]
@@ -234,6 +308,19 @@ class ClmTests(unittest.TestCase):
         self.assertIn("SUMMARY", mirror)  # the model's file starts over from the compacted context
         later = self.send(*history, *call(5)).body["input"]  # and it holds for later requests
         self.assertTrue(any("SUMMARY" in json.dumps(item) for item in later))
+
+    def test_overflow_guard_does_not_grow_a_short_tool_result(self) -> None:
+        self.engine = Engine(ContextLanguageModel(budget=4_000, reserve=200, directory=str(self.directory)))
+        tiny = call(1)
+        tiny[-1]["output"] = "done"
+        sent = self.send(msg("user", "task"), msg("assistant", "x" * 16_000), *tiny)
+        output = next(item["output"] for item in sent.body["input"]
+                      if item.get("type") == "function_call_output")
+        self.assertEqual(output, "done")
+        self.assertFalse((self.directory / "withheld").exists())
+        # Assistant text remains the model's responsibility; the guard must not
+        # claim that withholding a tiny result could make this request fit.
+        self.assertGreater(sent.estimate, 4_000)
 
     def test_what_an_edit_kept_is_never_withheld(self) -> None:
         self.engine = Engine(ContextLanguageModel(budget=4_000, reserve=200, directory=str(self.directory)))
